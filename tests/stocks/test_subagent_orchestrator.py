@@ -35,7 +35,7 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
         responses=[
             """
             {"items":[
-              {"symbol":"600001","strategy_name":"breakout_volume",
+              {"symbol":"600001","strategy_name":"B1",
                "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]}
             ],
             "screened_count": 5300,
@@ -62,7 +62,7 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
     )
     orchestrator = StockSelectionSubagentOrchestrator(executor=executor, screening_only=False)
 
-    report = await orchestrator.run_daily_stock_selection("breakout_volume", date(2026, 5, 26))
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     assert [label for label, _task, _system in executor.calls] == [
         "stock-screening",
@@ -83,7 +83,7 @@ async def test_orchestrator_rejects_invalid_subagent_json() -> None:
     orchestrator = StockSelectionSubagentOrchestrator(executor=executor)
 
     with pytest.raises(DailySelectionServiceError, match="stock-screening"):
-        await orchestrator.run_daily_stock_selection("breakout_volume", date(2026, 5, 26))
+        await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
 
 @pytest.mark.asyncio
@@ -92,9 +92,9 @@ async def test_orchestrator_defaults_to_screening_only_mode() -> None:
         responses=[
             """
             {"items":[
-              {"symbol":"600001","strategy_name":"breakout_volume",
+              {"symbol":"600001","strategy_name":"B1",
                "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]},
-              {"symbol":"600002","strategy_name":"breakout_volume",
+              {"symbol":"600002","strategy_name":"B1",
                "screen_pass_reasons":["volume expanded versus the recent average"],"risk_notes":["needs manual review"]}
             ]}
             """
@@ -102,7 +102,7 @@ async def test_orchestrator_defaults_to_screening_only_mode() -> None:
     )
     orchestrator = StockSelectionSubagentOrchestrator(executor=executor)
 
-    report = await orchestrator.run_daily_stock_selection("breakout_volume", date(2026, 5, 26))
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     assert [label for label, _task, _system in executor.calls] == ["stock-screening"]
     assert [item.symbol for item in report.selected_stocks] == ["600001", "600002"]
@@ -124,15 +124,15 @@ async def test_orchestrator_requires_supported_strategy() -> None:
 def test_orchestrator_stage_prompts_define_roles_contracts_and_fail_safes() -> None:
     orchestrator = StockSelectionSubagentOrchestrator(executor=_FakeExecutor(responses=[]))
 
-    screening_prompt = orchestrator._build_stock_screening_task("breakout_volume", date(2026, 5, 26))
+    screening_prompt = orchestrator._build_stock_screening_task("B1", date(2026, 5, 26))
     news_prompt = orchestrator._build_news_filter_task(["600001"])
     scoring_prompt = orchestrator._build_market_scoring_task(["600001"])
     summary_prompt = orchestrator._build_report_summary_task(["600001"])
 
     assert "Task: Execute the stock screening run" in screening_prompt
     assert "trade_date=2026-05-26" in screening_prompt
-    assert "strategy=breakout_volume" in screening_prompt
-    assert "strategy_skill_path=" in screening_prompt
+    assert "strategy=B1" in screening_prompt
+    assert "strategy_skill_path=" not in screening_prompt
     assert '"screened_count": 5300' in screening_prompt
 
     assert "Task: Assess recent material negative news risk" in news_prompt
@@ -152,7 +152,7 @@ def test_orchestrator_stage_prompts_define_roles_contracts_and_fail_safes() -> N
 def test_orchestrator_stage_prompts_are_loaded_from_templates() -> None:
     orchestrator = StockSelectionSubagentOrchestrator(executor=_FakeExecutor(responses=[]))
 
-    screening_prompt = orchestrator._build_stock_screening_task("breakout_volume", date(2026, 5, 26))
+    screening_prompt = orchestrator._build_stock_screening_task("B1", date(2026, 5, 26))
     screening_system = orchestrator._build_stock_screening_system_prompt()
 
     assert "Task: Execute the stock screening run" in screening_prompt
@@ -164,7 +164,7 @@ def test_orchestrator_stage_prompts_are_loaded_from_templates() -> None:
 def test_orchestrator_task_prompts_keep_hard_rules_out_of_user_layer() -> None:
     orchestrator = StockSelectionSubagentOrchestrator(executor=_FakeExecutor(responses=[]))
 
-    screening_prompt = orchestrator._build_stock_screening_task("breakout_volume", date(2026, 5, 26))
+    screening_prompt = orchestrator._build_stock_screening_task("B1", date(2026, 5, 26))
 
     assert "Role:" not in screening_prompt
     assert "Output must be valid JSON only." not in screening_prompt
@@ -181,7 +181,8 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
 
     assert "You are a specialized A-share screening analyst." in screening_system
     assert "Fetch the full A-share stock universe from the MCP server" in screening_system
-    assert "Read the mapped strategy skill from the workspace skills directory" in screening_system
+    assert "mapped strategy skill" not in screening_system
+    assert "workspace skills" in screening_system
 
     assert "You are a specialized A-share risk news analyst." in news_system
     assert "If news is unavailable" in news_system
@@ -192,17 +193,21 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
     assert "You are a specialized A-share report summarizer." in summary_system
     assert "Do not invent extra fields" in summary_system
 
+@pytest.mark.asyncio
+async def test_orchestrator_accepts_b2_strategy() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","strategy_name":"B2",
+               "screen_pass_reasons":["short-term moving averages are aligned above medium-term support"],"risk_notes":[]}
+            ]}
+            """
+        ]
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(executor=executor)
 
-def test_orchestrator_maps_strategy_to_workspace_skill_path() -> None:
-    orchestrator = StockSelectionSubagentOrchestrator(executor=_FakeExecutor(responses=[]))
+    report = await orchestrator.run_daily_stock_selection("B2", date(2026, 5, 26))
 
-    skill_path = orchestrator._strategy_skill_path("breakout_volume")
-
-    assert skill_path.as_posix().endswith("skills/breakout-volume/SKILL.md")
-
-
-def test_orchestrator_rejects_unknown_strategy_skill_mapping() -> None:
-    orchestrator = StockSelectionSubagentOrchestrator(executor=_FakeExecutor(responses=[]))
-
-    with pytest.raises(DailySelectionServiceError, match="unknown strategy"):
-        orchestrator._strategy_skill_path("missing")
+    assert report.strategy_name == "B2"
+    assert [item.symbol for item in report.selected_stocks] == ["600001"]

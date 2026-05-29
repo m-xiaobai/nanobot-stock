@@ -20,15 +20,8 @@ from nanobot.utils.prompt_templates import render_template
 
 
 _SUPPORTED_STRATEGIES = {
-    "breakout_volume",
-    "moving_average_alignment",
-    "strong_pullback",
-}
-
-_STRATEGY_SKILL_DIRS = {
-    "breakout_volume": "breakout-volume",
-    "moving_average_alignment": "moving-average-alignment",
-    "strong_pullback": "strong-pullback",
+    "B1",
+    "B2",
 }
 
 
@@ -188,7 +181,6 @@ class StockSelectionSubagentOrchestrator:
             strip=True,
             trade_date=trade_date.isoformat(),
             strategy_name=strategy_name,
-            strategy_skill_path=self._strategy_skill_path(strategy_name).as_posix(),
         )
 
     def _build_news_filter_task(self, symbols: list[str]) -> str:
@@ -211,13 +203,6 @@ class StockSelectionSubagentOrchestrator:
             strip=True,
             selected_json=json.dumps(selected_symbols, ensure_ascii=False),
         )
-
-    def _strategy_skill_path(self, strategy_name: str) -> Path:
-        try:
-            skill_dir = _STRATEGY_SKILL_DIRS[strategy_name]
-        except KeyError as exc:
-            raise DailySelectionServiceError(f"unknown strategy: {strategy_name}") from exc
-        return self.workspace / "skills" / skill_dir / "SKILL.md"
 
     @staticmethod
     def _merge_stage_outputs(

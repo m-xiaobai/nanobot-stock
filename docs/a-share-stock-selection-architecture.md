@@ -86,8 +86,8 @@
 当前主触发方式为：
 
 ```text
-/stock-report breakout_volume
-/stock-report breakout_volume 2026-05-26
+/stock-report B1
+/stock-report B1 2026-05-26
 ```
 
 调用链如下：
@@ -165,7 +165,7 @@
   "items": [
     {
       "symbol": "600001",
-      "strategy_name": "breakout_volume",
+      "strategy_name": "B1",
       "screen_pass_reasons": ["close broke above the recent range high"],
       "risk_notes": []
     }
@@ -332,29 +332,27 @@
 
 例如：
 
-- `skills/breakout-volume/SKILL.md`
-- `skills/moving-average-alignment/SKILL.md`
-- `skills/strong-pullback/SKILL.md`
+- `skills/b1/SKILL.md`
+- `skills/b2/SKILL.md`
 
 ### 6.2 读取方式
 
-由 **screening 子 agent 自行读取**对应策略 skill。
+由 **screening 子 agent 自主决定是否读取**对应策略 skill。
 
 这意味着：
 
 - orchestrator 不预读取 skill
 - orchestrator 不把 skill 正文直接塞给 screening
-- screening 负责“取股票池 + 读策略 + 做筛选”的完整过程
+- screening 负责“取股票池 + 结合策略上下文自主选 skill + 做筛选”的完整过程
 
 ### 6.3 `strategy_name` 与 skill 的映射
 
-建议使用显式映射：
+当前公开策略名仅保留：
 
-- `breakout_volume -> breakout-volume`
-- `moving_average_alignment -> moving-average-alignment`
-- `strong_pullback -> strong-pullback`
+- `B1`
+- `B2`
 
-不建议做模糊匹配，以避免策略名称与文件命名漂移。
+具体使用哪个 workspace skill 由 screening 子 agent 自主决定。
 
 ### 6.4 skill 的职责边界
 
@@ -457,7 +455,7 @@
 
 ### 9.2 当前建议规则
 
-- 策略 skill 不存在：直接报错
+- 不因缺少某个固定策略 skill 路径而在 orchestrator 层直接报错
 - 策略 skill 文件为空或格式错误：直接报错
 - MCP 无法返回 A 股股票池：直接报错
 - 新闻工具不可用：允许保留标的，但写入 `partial_failures`

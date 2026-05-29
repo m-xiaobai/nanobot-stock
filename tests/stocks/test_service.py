@@ -72,7 +72,7 @@ def _service(
     )
 
 
-def test_screen_stocks_breakout_strategy_is_deterministic() -> None:
+def test_screen_stocks_b1_strategy_is_deterministic() -> None:
     service = _service(
         universe=["600001", "600002"],
         price_map={
@@ -96,12 +96,12 @@ def test_screen_stocks_breakout_strategy_is_deterministic() -> None:
         articles_by_symbol={},
     )
 
-    results = service.screen_stocks("breakout_volume", ["600001", "600002"])
+    results = service.screen_stocks("B1", ["600001", "600002"])
 
     assert results == [
         ScreeningResult(
             symbol="600001",
-            strategy_name="breakout_volume",
+            strategy_name="B1",
             passed=True,
             screen_pass_reasons=[
                 "close broke above the recent range high",
@@ -111,7 +111,7 @@ def test_screen_stocks_breakout_strategy_is_deterministic() -> None:
         ),
         ScreeningResult(
             symbol="600002",
-            strategy_name="breakout_volume",
+            strategy_name="B1",
             passed=False,
             screen_pass_reasons=[],
             risk_notes=["price did not confirm a breakout setup"],
@@ -217,10 +217,10 @@ def test_run_daily_stock_selection_builds_report_and_preserves_reasons() -> None
         },
     )
 
-    report = service.run_daily_stock_selection("breakout_volume", date(2026, 5, 26))
+    report = service.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     assert report.trade_date == date(2026, 5, 26)
-    assert report.strategy_name == "breakout_volume"
+    assert report.strategy_name == "B1"
     assert report.market == "A"
     assert [stock.symbol for stock in report.selected_stocks] == ["600001"]
     assert "600001" in report.summary
@@ -251,7 +251,7 @@ def test_run_daily_stock_selection_degrades_when_news_adapter_fails() -> None:
         articles_by_symbol={"600001": TimeoutError("news timeout")},
     )
 
-    report = service.run_daily_stock_selection("breakout_volume", date(2026, 5, 26))
+    report = service.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     assert [stock.symbol for stock in report.selected_stocks] == ["600001"]
     assert report.partial_failures == ["news data unavailable for 600001: news timeout"]
@@ -259,8 +259,73 @@ def test_run_daily_stock_selection_degrades_when_news_adapter_fails() -> None:
     assert "news timeout" in report.selected_stocks[0].risk_notes[-1]
 
 
+def test_screen_stocks_b2_strategy_is_deterministic() -> None:
+    service = _service(
+        universe=["600001", "600002"],
+        price_map={
+            "600001": [
+                _bar(16, open_price=10.0, close=10.0, high=10.1, low=9.9, volume=100),
+                _bar(17, open_price=10.0, close=10.1, high=10.2, low=9.9, volume=101),
+                _bar(18, open_price=10.1, close=10.2, high=10.3, low=10.0, volume=102),
+                _bar(19, open_price=10.2, close=10.3, high=10.4, low=10.1, volume=103),
+                _bar(20, open_price=10.3, close=10.4, high=10.5, low=10.2, volume=104),
+                _bar(21, open_price=10.4, close=10.5, high=10.6, low=10.3, volume=105),
+                _bar(22, open_price=10.5, close=10.6, high=10.7, low=10.4, volume=106),
+                _bar(23, open_price=10.6, close=10.7, high=10.8, low=10.5, volume=107),
+                _bar(24, open_price=10.7, close=10.8, high=10.9, low=10.6, volume=108),
+                _bar(25, open_price=10.8, close=11.0, high=11.1, low=10.7, volume=109),
+            ],
+            "600002": [
+                _bar(16, open_price=10.0, close=10.5, high=10.6, low=9.9, volume=100),
+                _bar(17, open_price=10.5, close=10.4, high=10.6, low=10.3, volume=101),
+                _bar(18, open_price=10.4, close=10.3, high=10.5, low=10.2, volume=102),
+                _bar(19, open_price=10.3, close=10.2, high=10.4, low=10.1, volume=103),
+                _bar(20, open_price=10.2, close=10.1, high=10.3, low=10.0, volume=104),
+                _bar(21, open_price=10.1, close=10.0, high=10.2, low=9.9, volume=105),
+                _bar(22, open_price=10.0, close=9.9, high=10.1, low=9.8, volume=106),
+                _bar(23, open_price=9.9, close=9.8, high=10.0, low=9.7, volume=107),
+                _bar(24, open_price=9.8, close=9.7, high=9.9, low=9.6, volume=108),
+                _bar(25, open_price=9.7, close=9.6, high=9.8, low=9.5, volume=109),
+            ],
+        },
+        articles_by_symbol={},
+    )
+
+    results = service.screen_stocks("B2", ["600001", "600002"])
+
+    assert results == [
+        ScreeningResult(
+            symbol="600001",
+            strategy_name="B2",
+            passed=True,
+            screen_pass_reasons=[
+                "short-term moving averages are aligned above medium-term support",
+            ],
+            risk_notes=[],
+        ),
+        ScreeningResult(
+            symbol="600002",
+            strategy_name="B2",
+            passed=False,
+            screen_pass_reasons=[],
+            risk_notes=["moving averages are not in a bullish alignment"],
+        ),
+    ]
+
+
 def test_run_daily_stock_selection_rejects_unknown_strategy() -> None:
     service = _service(universe=[], price_map={}, articles_by_symbol={})
 
     with pytest.raises(DailySelectionServiceError, match="unknown strategy"):
         service.run_daily_stock_selection("missing", date(2026, 5, 26))
+
+
+@pytest.mark.parametrize(
+    "strategy_name",
+    ["breakout_volume", "moving_average_alignment", "strong_pullback"],
+)
+def test_run_daily_stock_selection_rejects_removed_legacy_strategies(strategy_name: str) -> None:
+    service = _service(universe=[], price_map={}, articles_by_symbol={})
+
+    with pytest.raises(DailySelectionServiceError, match="unknown strategy"):
+        service.run_daily_stock_selection(strategy_name, date(2026, 5, 26))

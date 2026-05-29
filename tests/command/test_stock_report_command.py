@@ -47,7 +47,7 @@ async def test_stock_report_command_shows_usage_without_args() -> None:
 
 @pytest.mark.asyncio
 async def test_stock_report_command_requires_service_configuration() -> None:
-    out = await cmd_stock_report(_ctx("/stock-report breakout_volume", args="breakout_volume"))
+    out = await cmd_stock_report(_ctx("/stock-report B1", args="B1"))
 
     assert "stock selection service is not configured" in out.content
 
@@ -56,12 +56,12 @@ async def test_stock_report_command_requires_service_configuration() -> None:
 async def test_stock_report_command_runs_service_and_formats_report() -> None:
     report = DailySelectionReport(
         trade_date=date(2026, 5, 26),
-        strategy_name="breakout_volume",
+        strategy_name="B1",
         market="A",
         selected_stocks=[
             SelectedStockReport(
                 symbol="600001",
-                strategy_name="breakout_volume",
+                strategy_name="B1",
                 screen_pass_reasons=["close broke above the recent range high"],
                 negative_news_flags=[],
                 technical_score=95,
@@ -77,12 +77,12 @@ async def test_stock_report_command_runs_service_and_formats_report() -> None:
     service = _FakeService(report)
 
     out = await cmd_stock_report(
-        _ctx("/stock-report breakout_volume 2026-05-26", args="breakout_volume 2026-05-26", service=service)
+        _ctx("/stock-report B1 2026-05-26", args="B1 2026-05-26", service=service)
     )
 
-    assert service.calls == [("breakout_volume", date(2026, 5, 26))]
+    assert service.calls == [("B1", date(2026, 5, 26))]
     assert "## Stock Report" in out.content
-    assert "- Strategy: `breakout_volume`" in out.content
+    assert "- Strategy: `B1`" in out.content
     assert "- Trade date: `2026-05-26`" in out.content
     assert "- `600001` score `95`" in out.content
     assert "close broke above the recent range high" in out.content
@@ -94,7 +94,7 @@ async def test_stock_report_command_runs_service_and_formats_report() -> None:
 async def test_stock_report_command_prefers_async_orchestrator_when_present() -> None:
     report = DailySelectionReport(
         trade_date=date(2026, 5, 26),
-        strategy_name="breakout_volume",
+        strategy_name="B1",
         market="A",
         selected_stocks=[],
         summary="async report",
@@ -102,13 +102,13 @@ async def test_stock_report_command_prefers_async_orchestrator_when_present() ->
         partial_failures=[],
     )
     async_service = _AsyncFakeService(report)
-    msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/stock-report breakout_volume")
+    msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/stock-report B1")
     loop = SimpleNamespace(stock_selection_service=None, stock_selection_orchestrator=async_service)
-    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=msg.content, args="breakout_volume", loop=loop)
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=msg.content, args="B1", loop=loop)
 
     out = await cmd_stock_report(ctx)
 
-    assert async_service.calls == [("breakout_volume", date.today())]
+    assert async_service.calls == [("B1", date.today())]
     assert "async report" in out.content
 
 
@@ -118,7 +118,7 @@ async def test_stock_report_command_is_registered_on_router() -> None:
     register_builtin_commands(router)
     report = DailySelectionReport(
         trade_date=date(2026, 5, 26),
-        strategy_name="breakout_volume",
+        strategy_name="B1",
         market="A",
         selected_stocks=[],
         summary="no candidates",
@@ -128,11 +128,45 @@ async def test_stock_report_command_is_registered_on_router() -> None:
     service = _FakeService(report)
 
     out = await router.dispatch(
-        _ctx("/stock-report breakout_volume", args="breakout_volume", service=service)
+        _ctx("/stock-report B1", args="B1", service=service)
     )
 
     assert out is not None
     assert "## Stock Report" in out.content
+
+
+@pytest.mark.asyncio
+async def test_stock_report_command_supports_b2() -> None:
+    report = DailySelectionReport(
+        trade_date=date(2026, 5, 26),
+        strategy_name="B2",
+        market="A",
+        selected_stocks=[],
+        summary="B2 report",
+        global_risk_disclaimer="For research use only.",
+        partial_failures=[],
+    )
+    service = _FakeService(report)
+
+    out = await cmd_stock_report(_ctx("/stock-report B2", args="B2", service=service))
+
+    assert service.calls == [("B2", date.today())]
+    assert "- Strategy: `B2`" in out.content
+
+
+@pytest.mark.asyncio
+async def test_stock_report_command_surfaces_unknown_legacy_strategy() -> None:
+    class _ErrorService:
+        def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
+            from nanobot.stocks.service import DailySelectionServiceError
+
+            raise DailySelectionServiceError(f"unknown strategy: {strategy_name}")
+
+    out = await cmd_stock_report(
+        _ctx("/stock-report breakout_volume", args="breakout_volume", service=_ErrorService())
+    )
+
+    assert "unknown strategy: breakout_volume" in out.content
 
 
 def test_stock_report_command_in_help_and_palette() -> None:

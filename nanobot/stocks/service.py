@@ -124,9 +124,8 @@ class StrategyDefinition:
 
 
 _SUPPORTED_STRATEGIES = {
-    "breakout_volume": StrategyDefinition(name="breakout_volume", lookback_days=30),
-    "moving_average_alignment": StrategyDefinition(name="moving_average_alignment", lookback_days=30),
-    "strong_pullback": StrategyDefinition(name="strong_pullback", lookback_days=30),
+    "B1": StrategyDefinition(name="B1", lookback_days=30),
+    "B2": StrategyDefinition(name="B2", lookback_days=30),
 }
 
 
@@ -197,12 +196,10 @@ class DailySelectionService:
         results: list[ScreeningResult] = []
         for symbol in universe:
             bars = self._get_bars(symbol, strategy.lookback_days)
-            if strategy.name == "breakout_volume":
-                results.append(self._screen_breakout_volume(symbol, bars))
-            elif strategy.name == "moving_average_alignment":
-                results.append(self._screen_moving_average_alignment(symbol, bars))
+            if strategy.name == "B1":
+                results.append(self._screen_b1(symbol, bars))
             else:
-                results.append(self._screen_strong_pullback(symbol, bars))
+                results.append(self._screen_b2(symbol, bars))
         return results
 
     def filter_negative_news(self, symbols: list[str], lookback_window: int) -> list[NewsFilteredStock]:
@@ -225,11 +222,11 @@ class DailySelectionService:
     def _get_bars(self, symbol: str, lookback_days: int) -> list[PriceBar]:
         return self._market_data.get_price_series(symbol, lookback_days).bars
 
-    def _screen_breakout_volume(self, symbol: str, bars: list[PriceBar]) -> ScreeningResult:
+    def _screen_b1(self, symbol: str, bars: list[PriceBar]) -> ScreeningResult:
         if len(bars) < 6:
             return ScreeningResult(
                 symbol=symbol,
-                strategy_name="breakout_volume",
+                strategy_name="B1",
                 passed=False,
                 screen_pass_reasons=[],
                 risk_notes=["not enough price history for breakout screening"],
@@ -246,24 +243,24 @@ class DailySelectionService:
         if len(reasons) == 2:
             return ScreeningResult(
                 symbol=symbol,
-                strategy_name="breakout_volume",
+                strategy_name="B1",
                 passed=True,
                 screen_pass_reasons=reasons,
                 risk_notes=[],
             )
         return ScreeningResult(
             symbol=symbol,
-            strategy_name="breakout_volume",
+            strategy_name="B1",
             passed=False,
             screen_pass_reasons=[],
             risk_notes=["price did not confirm a breakout setup"],
         )
 
-    def _screen_moving_average_alignment(self, symbol: str, bars: list[PriceBar]) -> ScreeningResult:
+    def _screen_b2(self, symbol: str, bars: list[PriceBar]) -> ScreeningResult:
         if len(bars) < 10:
             return ScreeningResult(
                 symbol=symbol,
-                strategy_name="moving_average_alignment",
+                strategy_name="B2",
                 passed=False,
                 screen_pass_reasons=[],
                 risk_notes=["not enough price history for moving average alignment"],
@@ -275,7 +272,7 @@ class DailySelectionService:
         if closes[-1] > ma3 > ma5 > ma10:
             return ScreeningResult(
                 symbol=symbol,
-                strategy_name="moving_average_alignment",
+                strategy_name="B2",
                 passed=True,
                 screen_pass_reasons=[
                     "short-term moving averages are aligned above medium-term support",
@@ -284,41 +281,10 @@ class DailySelectionService:
             )
         return ScreeningResult(
             symbol=symbol,
-            strategy_name="moving_average_alignment",
+            strategy_name="B2",
             passed=False,
             screen_pass_reasons=[],
             risk_notes=["moving averages are not in a bullish alignment"],
-        )
-
-    def _screen_strong_pullback(self, symbol: str, bars: list[PriceBar]) -> ScreeningResult:
-        if len(bars) < 6:
-            return ScreeningResult(
-                symbol=symbol,
-                strategy_name="strong_pullback",
-                passed=False,
-                screen_pass_reasons=[],
-                risk_notes=["not enough price history for pullback screening"],
-            )
-        recent_peak = max(bar.high for bar in bars[-6:-1])
-        latest = bars[-1]
-        prior_avg_volume = mean(bar.volume for bar in bars[-6:-1])
-        if latest.close < recent_peak and latest.close > recent_peak * 0.95 and latest.volume < prior_avg_volume:
-            return ScreeningResult(
-                symbol=symbol,
-                strategy_name="strong_pullback",
-                passed=True,
-                screen_pass_reasons=[
-                    "price is consolidating above the recent breakout zone",
-                    "pullback volume is lower than the prior advance",
-                ],
-                risk_notes=[],
-            )
-        return ScreeningResult(
-            symbol=symbol,
-            strategy_name="strong_pullback",
-            passed=False,
-            screen_pass_reasons=[],
-            risk_notes=["pullback quality is not strong enough"],
         )
 
     def _safe_news_filter(self, symbol: str) -> tuple[NewsFilteredStock, str | None]:
