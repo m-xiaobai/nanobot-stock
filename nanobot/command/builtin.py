@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import date
 
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.stocks.service import DailySelectionServiceError
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 
@@ -79,6 +82,13 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "Tell the agent to treat the request as a long-running goal.",
         "activity",
         "<goal>",
+    ),
+    BuiltinCommandSpec(
+        "/stock-report",
+        "Run stock report",
+        "Run the A-share stock selection report for a strategy and optional date.",
+        "chart-candlestick",
+        "<strategy> [YYYY-MM-DD]",
     ),
     BuiltinCommandSpec(
         "/dream",
@@ -594,6 +604,89 @@ async def cmd_goal(ctx: CommandContext) -> OutboundMessage | None:
     return None
 
 
+def _parse_stock_report_args(raw_args: str) -> tuple[str, date]:
+    parts = raw_args.split()
+    if not parts:
+        raise DailySelectionServiceError("missing strategy")
+    strategy = parts[0]
+    trade_date = date.today()
+    if len(parts) > 1:
+        try:
+            trade_date = date.fromisoformat(parts[1])
+        except ValueError as exc:
+            raise DailySelectionServiceError("date must use YYYY-MM-DD") from exc
+    if len(parts) > 2:
+        raise DailySelectionServiceError("too many arguments")
+    return strategy, trade_date
+
+
+def _render_stock_report(report) -> str:
+    lines = [
+        "## Stock Report",
+        f"- Strategy: `{report.strategy_name}`",
+        f"- Trade date: `{report.trade_date.isoformat()}`",
+        f"- Market: `{report.market}`",
+        "",
+        "### Selected",
+    ]
+    if report.selected_stocks:
+        for stock in report.selected_stocks:
+            lines.append(f"- `{stock.symbol}` score `{stock.technical_score}`")
+            lines.append(f"  screen: {', '.join(stock.screen_pass_reasons) or 'n/a'}")
+            lines.append(f"  score: {', '.join(stock.score_reasons) or 'n/a'}")
+            if stock.risk_notes:
+                lines.append(f"  risks: {', '.join(stock.risk_notes)}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "### Summary", report.summary])
+    if report.partial_failures:
+        lines.extend(["", "### Partial Failures", *[f"- {item}" for item in report.partial_failures]])
+    lines.extend(["", "### Disclaimer", report.global_risk_disclaimer])
+    return "\n".join(lines)
+
+
+async def cmd_stock_report(ctx: CommandContext) -> OutboundMessage:
+    """Run the stock selection report with a configured domain service."""
+    metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+    if not ctx.args.strip():
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /stock-report <strategy> [YYYY-MM-DD]",
+            metadata=metadata,
+        )
+    orchestrator = getattr(ctx.loop, "stock_selection_orchestrator", None)
+    service = getattr(ctx.loop, "stock_selection_service", None)
+    runner = orchestrator or service
+    if runner is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=(
+                "The stock selection service is not configured. "
+                "Attach a market/news adapter before using `/stock-report`."
+            ),
+            metadata=metadata,
+        )
+    try:
+        strategy_name, trade_date = _parse_stock_report_args(ctx.args.strip())
+        result = runner.run_daily_stock_selection(strategy_name, trade_date)
+        report = await result if inspect.isawaitable(result) else result
+    except DailySelectionServiceError as exc:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Usage error: {exc}. Usage: /stock-report <strategy> [YYYY-MM-DD]",
+            metadata=metadata,
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=_render_stock_report(report),
+        metadata=metadata,
+    )
+
+
 async def cmd_pairing(ctx: CommandContext) -> OutboundMessage:
     """List, approve, deny or revoke pairing requests."""
     from nanobot.pairing import PAIRING_COMMAND_META_KEY, handle_pairing_command
@@ -641,6 +734,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/history ", cmd_history)
     router.exact("/goal", cmd_goal)
     router.prefix("/goal ", cmd_goal)
+    router.exact("/stock-report", cmd_stock_report)
+    router.prefix("/stock-report ", cmd_stock_report)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)

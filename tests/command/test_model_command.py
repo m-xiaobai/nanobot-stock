@@ -15,6 +15,7 @@ from nanobot.command.builtin import (
 )
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.config.schema import ModelPresetConfig
+from nanobot.stocks.orchestrator import StockSelectionSubagentOrchestrator
 
 
 def _provider(default_model: str, max_tokens: int = 123) -> MagicMock:
@@ -190,3 +191,10 @@ def test_goal_command_in_help_and_palette() -> None:
     palette = builtin_command_palette()
     assert any(item["command"] == "/goal" and item["arg_hint"] == "<goal>" for item in palette)
     assert "/goal <goal>" in build_help_text()
+
+
+def test_agent_loop_has_default_stock_selection_orchestrator(tmp_path) -> None:
+    loop = _make_loop(tmp_path)
+
+    assert isinstance(loop.stock_selection_orchestrator, StockSelectionSubagentOrchestrator)
+    assert loop.stock_selection_orchestrator.executor is loop.subagents

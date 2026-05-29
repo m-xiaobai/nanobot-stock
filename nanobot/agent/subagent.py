@@ -80,6 +80,7 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
+        shared_tool_registry: ToolRegistry | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -98,6 +99,7 @@ class SubagentManager:
         self.max_concurrent_subagents = defaults.max_concurrent_subagents
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
+        self._shared_tool_registry = shared_tool_registry
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -125,7 +127,54 @@ class SubagentManager:
             file_state_store=FileStates(),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
+        self._register_shared_mcp_tools(registry)
         return registry
+
+    def _register_shared_mcp_tools(self, registry: ToolRegistry) -> None:
+        """Expose already-connected MCP tools from the parent agent to subagents."""
+        if self._shared_tool_registry is None:
+            return
+        for tool_name in self._shared_tool_registry.tool_names:
+            if not tool_name.startswith("mcp_") or registry.has(tool_name):
+                continue
+            tool = self._shared_tool_registry.get(tool_name)
+            if tool is not None:
+                registry.register(tool)
+
+    async def run_inline(
+        self,
+        *,
+        task: str,
+        label: str,
+        temperature: float | None = None,
+        extra_system_prompt: str | None = None,
+    ) -> str:
+        """Run a subagent task inline and return the final content."""
+        tools = self._build_tools()
+        system_prompt = self._build_subagent_prompt()
+        merged_system = system_prompt
+        if extra_system_prompt:
+            merged_system = f"{system_prompt.rstrip()}\n\n{extra_system_prompt.strip()}"
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": merged_system},
+            {"role": "user", "content": task},
+        ]
+        result = await self.runner.run(AgentRunSpec(
+            initial_messages=messages,
+            tools=tools,
+            model=self.model,
+            temperature=temperature,
+            max_iterations=self.max_iterations,
+            max_tool_result_chars=self.max_tool_result_chars,
+            hook=_SubagentHook(f"inline:{label}"),
+            max_iterations_message="Task completed but no final response was generated.",
+            error_message=None,
+            fail_on_tool_error=True,
+        ))
+        if result.stop_reason in {"error", "tool_error"}:
+            detail = result.error or self._format_partial_progress(result)
+            raise RuntimeError(f"subagent [{label}] failed: {detail}")
+        return result.final_content or "Task completed but no final response was generated."
 
     def set_provider(self, provider: LLMProvider, model: str) -> None:
         self.provider = provider
