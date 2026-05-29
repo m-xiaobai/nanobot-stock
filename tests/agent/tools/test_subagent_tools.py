@@ -128,6 +128,51 @@ async def test_spawn_forwards_temperature_to_run_spec(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_inline_supports_stage_specific_system_prompt(tmp_path):
+    """Inline subagents should merge the stage-specific overlay into one system prompt."""
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+    seen = {}
+
+    async def fake_run(spec):
+        seen["messages"] = spec.initial_messages
+        return SimpleNamespace(
+            stop_reason="done",
+            final_content='{"ok":true}',
+            error=None,
+            tool_events=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+
+    result = await mgr.run_inline(
+        task="Return JSON only.",
+        label="stock-universe",
+        extra_system_prompt="Role: A-share stock universe builder",
+    )
+
+    assert result == '{"ok":true}'
+    assert seen["messages"][0]["role"] == "system"
+    assert "Role: A-share stock universe builder" in seen["messages"][0]["content"]
+    assert len([m for m in seen["messages"] if m["role"] == "system"]) == 1
+    assert seen["messages"][1] == {
+        "role": "user",
+        "content": "Return JSON only.",
+    }
+
+
+@pytest.mark.asyncio
 async def test_spawn_tool_rejects_when_at_concurrency_limit(tmp_path):
     """SpawnTool should return an error string when the concurrency limit is reached."""
     from nanobot.agent.subagent import SubagentManager
@@ -235,6 +280,25 @@ def test_agent_loop_passes_max_iterations_to_subagents(tmp_path):
     )
 
     assert loop.subagents.max_iterations == 42
+
+
+def test_agent_loop_passes_shared_tool_registry_to_subagents(tmp_path):
+    """Subagents should receive the loop's shared tool registry for MCP tool reuse."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+
+    loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+    )
+
+    assert loop.subagents._shared_tool_registry is loop.tools
 
 
 @pytest.mark.asyncio

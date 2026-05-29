@@ -42,6 +42,7 @@ from nanobot.session.webui_turns import (
     build_bus_progress_callback,
     mark_webui_session,
 )
+from nanobot.stocks.orchestrator import StockSelectionSubagentOrchestrator
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -248,6 +249,7 @@ class AgentLoop:
             schedule_background=lambda coro: self._schedule_background(coro),
         )
         self.tools = ToolRegistry()
+        self.stock_selection_service = None
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
@@ -263,6 +265,11 @@ class AgentLoop:
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
+            shared_tool_registry=self.tools,
+        )
+        self.stock_selection_orchestrator = StockSelectionSubagentOrchestrator(
+            executor=self.subagents,
+            workspace=workspace,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
