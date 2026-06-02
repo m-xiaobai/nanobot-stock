@@ -47,8 +47,8 @@ class StockSelectionSubagentOrchestrator:
     news_data: NewsDataAdapter | None = None
     market: str = "A"
     workspace: Path = Path(".")
-    screening_only: bool = True
-    news_filter_only: bool = False
+    screening_only: bool = False
+    news_filter_only: bool = True
     lookback_days: int = 3
 
     async def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
@@ -67,8 +67,7 @@ class StockSelectionSubagentOrchestrator:
                 screened=screened["items"],
             )
         review_items, auto_allowed_items, prescreen_failures = self._prepare_news_filter_inputs(
-            [str(item["symbol"]) for item in screened["items"]],
-            trade_date=trade_date,
+            [str(item["symbol"]) for item in screened["items"]]
         )
         reviewed_items: list[dict[str, Any]] = []
         reviewed_failures: list[str] = []
@@ -284,7 +283,6 @@ class StockSelectionSubagentOrchestrator:
     def _prepare_news_filter_inputs(
         self,
         symbols: list[str],
-        trade_date: date | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
         review_items: list[dict[str, Any]] = []
         auto_allowed_items: list[dict[str, Any]] = []
@@ -303,11 +301,7 @@ class StockSelectionSubagentOrchestrator:
 
         for symbol in symbols:
             try:
-                raw_articles = self.news_data.get_news(
-                    symbol,
-                    self.lookback_days,
-                    anchor_date=trade_date,
-                )
+                raw_articles = self.news_data.get_news(symbol, self.lookback_days)
             except Exception as exc:
                 message = f"news data unavailable for {symbol}: {exc}"
                 partial_failures.append(message)
