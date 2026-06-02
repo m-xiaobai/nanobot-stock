@@ -7,6 +7,9 @@ from datetime import date
 from statistics import mean
 from typing import Protocol
 
+from nanobot.stocks.news_adapter import adapt_news_articles
+from nanobot.stocks.news_rules import prescreen_negative_news
+
 
 class DailySelectionServiceError(ValueError):
     """Raised when the stock selection request is invalid."""
@@ -49,6 +52,7 @@ class PriceSeriesResponse:
 class NewsQueryRequest:
     symbol: str
     lookback_days: int
+    anchor_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,7 @@ class NewsArticle:
     published_at: str
     sentiment: str = "neutral"
     summary: str = ""
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -114,7 +119,12 @@ class MarketDataAdapter(Protocol):
 
 
 class NewsDataAdapter(Protocol):
-    def get_news(self, symbol: str, lookback_days: int) -> list[NewsArticle]: ...
+    def get_news(
+        self,
+        symbol: str,
+        lookback_days: int,
+        anchor_date: date | str | None = None,
+    ) -> list[NewsArticle]: ...
 
 
 @dataclass(frozen=True)
@@ -155,7 +165,7 @@ class DailySelectionService:
             if not result.passed:
                 continue
 
-            filter_result, filter_failure = self._safe_news_filter(result.symbol)
+            filter_result, filter_failure = self._safe_news_filter(result.symbol, trade_date)
             if filter_failure is not None:
                 partial_failures.append(filter_failure)
 
@@ -202,8 +212,13 @@ class DailySelectionService:
                 results.append(self._screen_b2(symbol, bars))
         return results
 
-    def filter_negative_news(self, symbols: list[str], lookback_window: int) -> list[NewsFilteredStock]:
-        return [self._filter_symbol_news(symbol, lookback_window) for symbol in symbols]
+    def filter_negative_news(
+        self,
+        symbols: list[str],
+        lookback_window: int,
+        anchor_date: date | None = None,
+    ) -> list[NewsFilteredStock]:
+        return [self._filter_symbol_news(symbol, lookback_window, anchor_date) for symbol in symbols]
 
     def score_market_view(self, symbols: list[str], indicator_profile: str) -> list[ScoredStock]:
         del indicator_profile
@@ -287,9 +302,9 @@ class DailySelectionService:
             risk_notes=["moving averages are not in a bullish alignment"],
         )
 
-    def _safe_news_filter(self, symbol: str) -> tuple[NewsFilteredStock, str | None]:
+    def _safe_news_filter(self, symbol: str, anchor_date: date | None = None) -> tuple[NewsFilteredStock, str | None]:
         try:
-            return self._filter_symbol_news(symbol, 3), None
+            return self._filter_symbol_news(symbol, 3, anchor_date), None
         except Exception as exc:
             message = f"news data unavailable for {symbol}: {exc}"
             return (
@@ -302,23 +317,22 @@ class DailySelectionService:
                 message,
             )
 
-    def _filter_symbol_news(self, symbol: str, lookback_window: int) -> NewsFilteredStock:
-        articles = self._news_data.get_news(symbol, lookback_window)
-        negative_titles = [
-            article.title
-            for article in articles
-            if article.sentiment.lower() == "negative"
-            or any(
-                keyword in article.title.lower()
-                for keyword in ("inquiry", "investigation", "default", "lawsuit", "freeze", "risk")
-            )
-        ]
-        if negative_titles:
+    def _filter_symbol_news(
+        self,
+        symbol: str,
+        lookback_window: int,
+        anchor_date: date | None = None,
+    ) -> NewsFilteredStock:
+        articles = self._news_data.get_news(symbol, lookback_window, anchor_date=anchor_date)
+        prescreened = prescreen_negative_news(symbol, adapt_news_articles(articles))
+        if prescreened.has_negative_candidates:
             return NewsFilteredStock(
                 symbol=symbol,
                 allowed=False,
-                negative_news_flags=negative_titles,
-                risk_notes=["recent negative news flow requires exclusion from the shortlist"],
+                negative_news_flags=[
+                    candidate.negative_news_flag for candidate in prescreened.candidate_articles
+                ],
+                risk_notes=["recent material negative news within 3 days"],
             )
         return NewsFilteredStock(symbol=symbol, allowed=True, negative_news_flags=[], risk_notes=[])
 

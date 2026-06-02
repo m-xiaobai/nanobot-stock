@@ -6,10 +6,19 @@ import sys
 from importlib import import_module
 from types import ModuleType
 
-from nanobot.utils.helpers import ensure_dir
-from nanobot.utils.path import abbreviate_path
-
 __all__ = ["ensure_dir", "abbreviate_path"]
+
+
+def ensure_dir(*args: object, **kwargs: object) -> object:
+    from nanobot.utils.helpers import ensure_dir as _ensure_dir
+
+    return _ensure_dir(*args, **kwargs)
+
+
+def abbreviate_path(*args: object, **kwargs: object) -> object:
+    from nanobot.utils.path import abbreviate_path as _abbreviate_path
+
+    return _abbreviate_path(*args, **kwargs)
 
 
 class _LazyModuleAlias(ModuleType):

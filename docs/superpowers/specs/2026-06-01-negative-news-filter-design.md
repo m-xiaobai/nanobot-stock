@@ -1,53 +1,53 @@
-# Negative News Filter Design
+# 负面新闻过滤器设计
 
-## Document Info
+## 文档信息
 
-- Author: Codex
-- Date: 2026-06-01
-- Status: Draft
-- Scope: `nanobot-stock` A-share negative news filter integrated into the existing stock subagent workflow
+- 作者：Codex
+- 日期：2026-06-01
+- 状态：草案
+- 范围：集成到现有股票子代理工作流中的 `nanobot-stock` A 股负面新闻过滤器
 
-## 1. Objective
+## 1. 目标
 
-Design and integrate a batch negative-news filter into `nanobot-stock` so that A-share candidate symbols are filtered by recent material negative news before they proceed to market scoring.
+为 `nanobot-stock` 设计并集成一个批量负面新闻过滤器，在候选 A 股进入市场打分之前，先根据近期重大负面新闻进行筛选。
 
-The filter must:
+该过滤器必须：
 
-- Consume a list of candidate stock symbols from `stock-screening`
-- Evaluate recent A-share news within the last 7 days
-- Exclude symbols with confirmed material negative news
-- Allow passing symbols to continue into `market-scoring`
-- Return the final externally visible result as the passed stock list
+- 接收来自 `stock-screening` 的候选股票代码列表
+- 评估最近 7 天内的 A 股相关新闻
+- 排除存在已确认重大负面新闻的股票代码
+- 允许通过的股票继续进入 `market-scoring`
+- 对外最终返回通过筛选的股票列表
 
-This feature is implemented in `nanobot-stock`, not in `TradingAgents-Astock`.
+该功能实现于 `nanobot-stock`，而不是 `TradingAgents-Astock`。
 
-## 2. Design Principles
+## 2. 设计原则
 
-- Preserve the existing four-stage workflow:
+- 保持现有四阶段工作流不变：
   - `stock-screening`
   - `news-filter`
   - `market-scoring`
   - `report-summary`
-- Reuse the A-share news-source approach from `TradingAgents-Astock`, but not its long-form `news_analyst` report pattern
-- Use a hybrid design: rule-based prescreening plus subagent review
-- Keep the external business output narrow: return only the symbols that passed
-- Preserve internal evidence for debugging, auditability, and future reporting
+- 复用 `TradingAgents-Astock` 的 A 股新闻源思路，但不采用其长篇 `news_analyst` 报告模式
+- 使用混合式设计：规则预筛 + 子代理复核
+- 保持对外业务输出简洁：只返回通过的股票代码
+- 保留内部证据，便于调试、审计和后续报告扩展
 
-## 3. Non-Goals
+## 3. 非目标
 
-- No full investment research report generation
-- No direct reuse of `policy`, `fundamentals`, or `lockup` analysts
-- No automatic order placement
-- No broad market sentiment prediction
-- No machine-learned classifier in v1
+- 不生成完整投研报告
+- 不直接复用 `policy`、`fundamentals` 或 `lockup` 分析代理
+- 不自动下单
+- 不做广义市场情绪预测
+- v1 不引入机器学习分类器
 
-## 4. Integration Point
+## 4. 集成位置
 
-The feature is integrated into the existing `news-filter` stage of `nanobot-stock`.
+该功能集成到 `nanobot-stock` 现有的 `news-filter` 阶段中。
 
-It does not add a fifth stage.
+它不会新增第五个阶段。
 
-### Existing flow
+### 现有流程
 
 ```text
 stock-screening
@@ -56,7 +56,7 @@ stock-screening
 -> report-summary
 ```
 
-### Upgraded `news-filter` stage
+### 升级后的 `news-filter` 阶段
 
 ```text
 candidate symbols
@@ -66,36 +66,36 @@ candidate symbols
 -> allowed symbols
 ```
 
-## 5. High-Level Architecture
+## 5. 高层架构
 
-The design is split into four layers.
+整体设计拆分为四层。
 
-### 5.1 News Adapter Layer
+### 5.1 新闻适配层
 
-Fetch recent A-share news for each symbol over the last 7 days.
+按股票代码抓取最近 7 天内的 A 股相关新闻。
 
-### 5.2 Rule Prescreen Layer
+### 5.2 规则预筛层
 
-Identify suspicious negative-news candidates with cheap, high-recall heuristics.
+使用低成本、高召回的启发式规则识别可疑负面新闻候选。
 
-### 5.3 Subagent Review Layer
+### 5.3 子代理复核层
 
-Review only prescreen hits and produce the final risk decision.
+仅复核命中预筛规则的内容，并给出最终风险判断。
 
-### 5.4 Orchestration Layer
+### 5.4 编排层
 
-Coordinate stage execution, validate JSON contracts, and move only allowed symbols to `market-scoring`.
+协调阶段执行、校验 JSON 契约，并仅将允许通过的股票代码送入 `market-scoring`。
 
-## 6. Business Contract
+## 6. 业务契约
 
-### 6.1 Inputs
+### 6.1 输入
 
-- Candidate stock symbols from `stock-screening`
-- Fixed lookback window: 7 days
+- 来自 `stock-screening` 的候选股票代码
+- 固定回看窗口：7 天
 
-### 6.2 External Output
+### 6.2 对外输出
 
-The externally visible business output is the list of passed symbols.
+对外可见的业务输出是通过筛选的股票代码列表。
 
 ```json
 {
@@ -103,9 +103,9 @@ The externally visible business output is the list of passed symbols.
 }
 ```
 
-### 6.3 Internal Stage Output
+### 6.3 内部阶段输出
 
-The internal `news-filter` stage keeps a richer structure for compatibility and debugging.
+内部的 `news-filter` 阶段会保留更丰富的数据结构，以便兼容现有流程并支持调试。
 
 ```json
 {
@@ -124,75 +124,75 @@ The internal `news-filter` stage keeps a richer structure for compatibility and 
 }
 ```
 
-The orchestrator continues to rely on `allowed` as the controlling field.
+编排器仍然以 `allowed` 作为控制流程的核心字段。
 
-## 7. Negative Event Scope
+## 7. 负面事件范围
 
-Version 1 supports these ten material negative-news categories:
+v1 支持以下十类重大负面新闻：
 
-1. Earnings blow-up
-2. Regulatory investigation or administrative penalty
-3. Major reduction plan or lockup-expiry pressure
-4. Debt or litigation risk
-5. Delisting or ST risk
-6. Major accident or production shutdown
-7. Abnormal core executive change
-8. Equity pledge or liquidation risk
-9. Major contract or order failure
-10. Non-standard audit opinion
+1. 业绩暴雷
+2. 监管调查或行政处罚
+3. 重大减持计划或限售解禁压力
+4. 债务或诉讼风险
+5. 退市或 ST 风险
+6. 重大事故或停产停工
+7. 核心高管异常变动
+8. 股权质押或平仓风险
+9. 重大合同或订单失效
+10. 非标准审计意见
 
-## 8. News Adapter Design
+## 8. 新闻适配器设计
 
-### 8.1 Responsibility
+### 8.1 职责
 
-The adapter fetches recent A-share news using a source approach aligned with `TradingAgents-Astock`.
+适配器使用与 `TradingAgents-Astock` 一致的新闻源思路抓取近期 A 股新闻。
 
-It should unify output into a single internal article shape and avoid embedding investment judgment.
+它应将输出统一为单一的内部文章结构，并避免在此层嵌入投资判断。
 
-### 8.2 Input
+### 8.2 输入
 
 - `symbol`
 - `lookback_days=7`
 
-### 8.3 Output Shape
+### 8.3 输出结构
 
 ```json
 [
   {
-    "title": "Company receives CSRC investigation notice",
-    "summary": "The company disclosed suspected information disclosure violations...",
+    "title": "公司收到证监会立案告知书",
+    "summary": "公司披露涉嫌信息披露违法违规……",
     "published_at": "2026-06-01T09:30:00+08:00",
     "source": "Eastmoney"
   }
 ]
 ```
 
-### 8.4 Requirements
+### 8.4 要求
 
-- Normalize timestamps
-- Prefer article objects with both `title` and `summary`
-- Deduplicate obvious duplicates
-- Surface dependency failures so they can become `partial_failures`
+- 统一时间戳格式
+- 优先保留同时包含 `title` 和 `summary` 的文章对象
+- 对明显重复的内容去重
+- 暴露依赖失败信息，以便纳入 `partial_failures`
 
-## 9. Rule Prescreen Design
+## 9. 规则预筛设计
 
-### 9.1 Goal
+### 9.1 目标
 
-The rule layer does not make the final exclusion decision.
+规则层不直接做最终排除判断。
 
-It only performs low-cost, high-recall candidate detection so that:
+它只负责以低成本、高召回的方式筛出候选项，从而实现：
 
-- obviously safe symbols can pass quickly
-- suspicious symbols are escalated to the subagent
+- 明显安全的股票可以快速通过
+- 可疑股票会升级到子代理复核
 
-### 9.2 Processing Steps
+### 9.2 处理步骤
 
-1. Normalize text from `title + summary`
-2. Match category keyword dictionaries
-3. Apply contextual exclusion rules
-4. Emit candidate articles and coarse severity
+1. 规范化 `title + summary` 文本
+2. 匹配类别关键词词典
+3. 应用上下文排除规则
+4. 输出候选文章及粗粒度严重级别
 
-### 9.3 Output Shape
+### 9.3 输出结构
 
 ```json
 {
@@ -201,7 +201,7 @@ It only performs low-cost, high-recall candidate detection so that:
   "candidate_articles": [
     {
       "date": "2026-06-01",
-      "title": "Company receives CSRC investigation notice",
+      "title": "公司收到证监会立案告知书",
       "matched_keywords": ["立案", "证监会"],
       "candidate_categories": ["regulatory investigation or administrative penalty"],
       "rule_severity": "high"
@@ -210,32 +210,32 @@ It only performs low-cost, high-recall candidate detection so that:
 }
 ```
 
-### 9.4 Prescreen Decision Policy
+### 9.4 预筛决策策略
 
-The rule layer should:
+规则层应当：
 
-- pass symbols directly if no candidate articles are found
-- escalate symbols to subagent review if candidate articles exist
+- 未发现候选文章时，直接放行股票代码
+- 一旦存在候选文章，就升级到子代理复核
 
-It must not directly reject symbols in v1.
+在 v1 中，规则层不能直接拒绝股票。
 
-## 10. Contextual Exclusion Rules
+## 10. 上下文排除规则
 
-### 10.1 Purpose
+### 10.1 目的
 
-Contextual exclusion rules reduce false positives after keyword hits.
+上下文排除规则用于在关键词命中后进一步降低误报。
 
-They operate as a second pass that looks for nearby evidence that a matched keyword is not actually signaling material negative news.
+它作为第二道检查，会寻找相邻上下文中的证据，判断命中的关键词是否真的代表重大负面新闻。
 
-### 10.2 Rule Model
+### 10.2 规则模型
 
-Each negative category should support:
+每一类负面事件都应支持：
 
-- `include` terms
-- `exclude` terms
-- coarse severity
+- `include` 词项
+- `exclude` 词项
+- 粗粒度严重级别
 
-Example conceptual structure:
+概念示例如下：
 
 ```python
 NEGATIVE_RULES = {
@@ -247,13 +247,13 @@ NEGATIVE_RULES = {
 }
 ```
 
-### 10.3 Priority Policy
+### 10.3 优先级策略
 
-The rule layer should distinguish between strong and weak triggers.
+规则层应区分强触发词和弱触发词。
 
-#### Strong triggers
+#### 强触发词
 
-Examples:
+示例：
 
 - `立案`
 - `处罚`
@@ -263,14 +263,14 @@ Examples:
 - `爆炸`
 - `停产`
 
-Behavior:
+处理方式：
 
-- never drop on weak exclusion evidence
-- downgrade or keep for subagent review
+- 不能因为弱排除证据而直接丢弃
+- 只能降级或保留给子代理复核
 
-#### Weak triggers
+#### 弱触发词
 
-Examples:
+示例：
 
 - `风险`
 - `调查`
@@ -278,48 +278,48 @@ Examples:
 - `辞职`
 - `减持`
 
-Behavior:
+处理方式：
 
-- if exclusion context is clearly present, drop
-- if mixed or ambiguous, downgrade and still escalate
+- 如果排除上下文明确存在，则丢弃
+- 如果语义混杂或存在歧义，则降级但仍升级复核
 
-### 10.4 Output States
+### 10.4 输出状态
 
-Context checks should result in one of:
+上下文检查应输出以下三种状态之一：
 
 - `keep`
 - `downgrade`
 - `drop`
 
-### 10.5 Priority False-Positive Cases
+### 10.5 重点误报场景
 
-Version 1 should explicitly address these high-frequency false positives:
+v1 应显式处理以下高频误报：
 
-- `调查` vs `机构调研` / `投资者调研`
-- `风险` vs generic `风险提示公告`
-- `辞职` vs normal `任期届满` / `换届`
-- `诉讼` vs `已结案` / `胜诉`
-- `减持` vs ETF or fund rebalancing / passive selling
+- `调查` 与 `机构调研` / `投资者调研`
+- `风险` 与通用 `风险提示公告`
+- `辞职` 与正常的 `任期届满` / `换届`
+- `诉讼` 与 `已结案` / `胜诉`
+- `减持` 与 ETF 或基金调仓 / 被动卖出
 
-## 11. Subagent Review Design
+## 11. 子代理复核设计
 
-### 11.1 Responsibility
+### 11.1 职责
 
-The subagent reviews only the candidate articles produced by the rule layer.
+子代理只复核规则层输出的候选文章。
 
-It decides whether the symbol should be:
+它负责判断该股票应当被标记为：
 
 - `PASS`
 - `REVIEW`
 - `REJECT`
 
-### 11.2 Mapping to `allowed`
+### 11.2 到 `allowed` 的映射
 
 - `PASS` -> `allowed: true`
-- `REVIEW` -> `allowed: true` in v1, plus risk notes
+- `REVIEW` -> v1 中仍为 `allowed: true`，但附加风险说明
 - `REJECT` -> `allowed: false`
 
-### 11.3 Output Shape
+### 11.3 输出结构
 
 ```json
 {
@@ -340,43 +340,43 @@ It decides whether the symbol should be:
 }
 ```
 
-### 11.4 Prompt Constraints
+### 11.4 Prompt 约束
 
-The `news-filter` subagent prompt must:
+`news-filter` 子代理的 prompt 必须：
 
-- output valid JSON only
-- avoid markdown or prose
-- avoid fabricating missing news
-- only review the supplied candidate articles
-- not fetch or infer unrelated facts beyond the provided evidence set unless explicitly allowed by the stage design
+- 只输出合法 JSON
+- 不输出 markdown 或额外说明文字
+- 不得编造缺失新闻
+- 只允许复核提供的候选文章
+- 除非阶段设计明确允许，否则不得抓取或推断证据集之外的无关事实
 
-## 12. Orchestrator Behavior
+## 12. 编排器行为
 
-### 12.1 Responsibilities
+### 12.1 职责
 
-The orchestrator must:
+编排器必须：
 
-- receive screened symbols
-- invoke the upgraded `news-filter` stage
-- parse and validate returned JSON
-- retain only `allowed` symbols
-- pass those symbols into `market-scoring`
+- 接收筛选后的股票代码
+- 调用升级后的 `news-filter` 阶段
+- 解析并校验返回的 JSON
+- 仅保留 `allowed` 的股票代码
+- 将这些股票继续传入 `market-scoring`
 
-### 12.2 Compatibility Requirement
+### 12.2 兼容性要求
 
-The orchestrator should continue to use `allowed` as the minimum hard contract.
+编排器应继续将 `allowed` 作为最低限度的硬性契约字段。
 
-Additional fields such as:
+其他字段例如：
 
 - `decision`
 - `matched_categories`
 - `evidence`
 
-may be accepted and preserved without being required for control flow.
+可以被接受并保留，但不要求参与控制流。
 
-## 13. File-Level Placement
+## 13. 文件级落点
 
-The design is intended to land in these areas of `nanobot-stock`:
+该设计预计落在 `nanobot-stock` 的以下位置：
 
 - `nanobot/stocks/news_adapter.py`
 - `nanobot/stocks/news_rules.py`
@@ -385,94 +385,94 @@ The design is intended to land in these areas of `nanobot-stock`:
 - `nanobot/stocks/orchestrator.py`
 - `tests/stocks/test_subagent_orchestrator.py`
 
-The exact filenames can vary slightly, but the boundaries should remain the same.
+具体文件名可以略有调整，但职责边界应保持一致。
 
-## 14. Failure Handling
+## 14. 失败处理
 
-### 14.1 News Source Failure
+### 14.1 新闻源失败
 
-- do not fabricate negative evidence
-- record a `partial_failures` entry
-- default to preserving the symbol in v1 unless confirmed negative news exists
+- 不得伪造负面证据
+- 记录一条 `partial_failures`
+- 在 v1 中，除非已确认存在负面新闻，否则默认保留该股票代码
 
-### 14.2 Rule Layer Failure
+### 14.2 规则层失败
 
-- prefer per-symbol degradation over batch failure
-- surface the issue in diagnostics
+- 优先按单个股票降级处理，而不是让整批失败
+- 在诊断信息中暴露问题
 
-### 14.3 Invalid Subagent JSON
+### 14.3 子代理 JSON 非法
 
-- treat as `news-filter` stage failure
-- raise a clear orchestrator error
+- 视为 `news-filter` 阶段失败
+- 由编排器抛出明确错误
 
-### 14.4 Per-Symbol Failure
+### 14.4 单股票失败
 
-- isolate failure to that symbol where possible
-- avoid collapsing the entire batch
+- 尽可能将失败隔离在该股票上
+- 避免拖垮整批处理
 
-## 15. Testing Requirements
+## 15. 测试要求
 
-### 15.1 Unit Tests
+### 15.1 单元测试
 
-Add tests for:
+新增以下测试：
 
-- category keyword matches
-- contextual exclusion rules
-- candidate article generation
-- decision mapping from `PASS/REVIEW/REJECT` to `allowed`
+- 类别关键词匹配
+- 上下文排除规则
+- 候选文章生成
+- `PASS/REVIEW/REJECT` 到 `allowed` 的决策映射
 
-### 15.2 Orchestrator Tests
+### 15.2 编排器测试
 
-Extend `tests/stocks/test_subagent_orchestrator.py` to verify:
+扩展 `tests/stocks/test_subagent_orchestrator.py`，验证：
 
-- expanded `news-filter` JSON fields are accepted
-- `allowed=false` symbols never reach `market-scoring`
-- final passed symbol output is correct
+- 扩展后的 `news-filter` JSON 字段能够被接受
+- `allowed=false` 的股票绝不会进入 `market-scoring`
+- 最终通过的股票列表输出正确
 
-### 15.3 Failure Tests
+### 15.3 失败测试
 
-Cover:
+覆盖以下场景：
 
-- news-source dependency failure
-- empty news set
-- invalid subagent JSON
-- all symbols rejected
-- all symbols passed
+- 新闻源依赖失败
+- 新闻集合为空
+- 子代理 JSON 非法
+- 所有股票都被拒绝
+- 所有股票都通过
 
-## 16. Implementation Phases
+## 16. 实施阶段
 
-### Phase 1
+### 阶段 1
 
-- introduce the A-share news adapter
-- implement negative-news rule dictionaries
-- implement the prescreen layer
-- cover the rule layer with tests
+- 引入 A 股新闻适配器
+- 实现负面新闻规则词典
+- 实现预筛层
+- 为规则层补齐测试
 
-### Phase 2
+### 阶段 2
 
-- upgrade `news_filter` system and task templates
-- connect the prescreen output to subagent review
-- extend the internal JSON contract
+- 升级 `news_filter` 的 system 和 task 模板
+- 将预筛输出接入子代理复核
+- 扩展内部 JSON 契约
 
-### Phase 3
+### 阶段 3
 
-- update orchestrator merge behavior
-- expose the externally visible passed-symbol list
-- complete integration tests
+- 更新编排器的合并行为
+- 对外暴露通过筛选的股票列表
+- 完成集成测试
 
-## 17. Final Summary
+## 17. 最终总结
 
-This design upgrades the existing `news-filter` stage in `nanobot-stock` into a production-oriented A-share negative-news filter.
+该设计将 `nanobot-stock` 现有的 `news-filter` 阶段升级为一个面向生产的 A 股负面新闻过滤器。
 
-The system reuses the A-share news-source approach from `TradingAgents-Astock`, but not its analyst-style reporting flow.
+系统复用了 `TradingAgents-Astock` 的 A 股新闻源思路，但不沿用其分析师式报告流程。
 
-The core model is:
+核心模型如下：
 
-- rules perform high-recall candidate detection
-- the subagent performs semantic review and final judgment
-- the orchestrator preserves only allowed symbols
-- the business-facing output returns the final passed stock list
+- 规则负责高召回候选检测
+- 子代理负责语义复核与最终裁决
+- 编排器只保留允许通过的股票
+- 面向业务的输出只返回最终通过的股票列表
 
-In short:
+一句话概括：
 
-**rules recall, subagent adjudicates, orchestrator routes, and the external interface returns only the symbols that passed.**
+**规则负责召回，子代理负责裁决，编排器负责路由，对外接口只返回通过的股票代码。**

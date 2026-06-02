@@ -43,6 +43,7 @@ from nanobot.session.webui_turns import (
     mark_webui_session,
 )
 from nanobot.stocks.orchestrator import StockSelectionSubagentOrchestrator
+from nanobot.stocks.real_news_adapter import EastmoneySinaNewsAdapter
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -269,7 +270,10 @@ class AgentLoop:
         )
         self.stock_selection_orchestrator = StockSelectionSubagentOrchestrator(
             executor=self.subagents,
+            news_data=EastmoneySinaNewsAdapter(),
             workspace=workspace,
+            screening_only=False,
+            news_filter_only=True,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
