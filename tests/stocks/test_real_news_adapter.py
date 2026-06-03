@@ -144,3 +144,48 @@ def test_real_news_adapter_prefers_trade_date_for_lookback_window(
     articles = adapter.get_news("600001", 3, anchor_date="2026-06-01")
 
     assert [article.title for article in articles] == ["旧闻"]
+
+
+def test_real_news_adapter_pages_eastmoney_results_to_find_window_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _page_payload(rows: list[dict[str, str]]) -> str:
+        return f"jQuery_news({json.dumps({'result': {'cmsArticleWebOld': {'list': rows}}}, ensure_ascii=False)})"
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        if "search-api-web.eastmoney.com" not in url:
+            return httpx.Response(200, text="<html></html>")
+        params = kwargs["params"]
+        inner = json.loads(params["param"])
+        page_index = inner["param"]["cmsArticleWebOld"]["pageIndex"]
+        if page_index == 1:
+            rows = [
+                {
+                    "title": "窗口外旧闻",
+                    "content": "旧闻摘要",
+                    "date": "2026-05-12 18:48:00",
+                    "mediaName": "东方财富网",
+                    "url": "https://example.com/old",
+                }
+            ]
+        elif page_index == 2:
+            rows = [
+                {
+                    "title": "窗口内新闻",
+                    "content": "窗口内摘要",
+                    "date": "2026-05-28 09:30:00",
+                    "mediaName": "东方财富网",
+                    "url": "https://example.com/in-window",
+                }
+            ]
+        else:
+            rows = []
+        return httpx.Response(200, text=_page_payload(rows))
+
+    monkeypatch.setattr("nanobot.stocks.real_news_adapter.httpx.get", fake_get)
+
+    adapter = EastmoneySinaNewsAdapter(current_date_provider=lambda: "2026-06-05")
+
+    articles = adapter.get_news("000029", 3, anchor_date="2026-05-29")
+
+    assert [article.title for article in articles] == ["窗口内新闻"]

@@ -128,13 +128,39 @@ class StockSelectionSubagentOrchestrator:
             temperature=0.0,
             extra_system_prompt=self._build_stage_system_prompt(stage),
         )
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise DailySelectionServiceError(f"{stage} returned invalid JSON: {exc}") from exc
+        parsed = self._extract_json(raw, stage)
         if not isinstance(parsed, dict):
             raise DailySelectionServiceError(f"{stage} returned non-object JSON")
         return parsed
+
+    @staticmethod
+    def _extract_json(raw: str, stage: str) -> dict[str, Any]:
+        """Robust JSON extraction that tolerates surrounding text and code fences."""
+        raw = raw.strip()
+        # 1. Try direct parse
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        # 2. Try extracting ```json ... ``` block
+        import re
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+        # 3. Try first { ... } object (handles trailing text)
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        # 4. Give up
+        raise DailySelectionServiceError(
+            f"{stage} returned invalid JSON: cannot extract JSON object from output"
+        )
 
     def _build_screening_only_report(
         self,

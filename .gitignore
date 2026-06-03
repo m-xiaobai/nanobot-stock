@@ -99,3 +99,7 @@ temp/
 *.tmp
 exp/
 .playwright-mcp/
+
+
+.venv/
+venv/

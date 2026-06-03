@@ -29,6 +29,8 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
     """Fetch stock-specific news from Eastmoney with Sina fallback."""
 
     timeout: float = 15.0
+    eastmoney_max_pages: int = 5
+    eastmoney_page_size: int = 20
     current_date_provider: Callable[[], date | datetime | str] = field(
         default=lambda: date.today()
     )
@@ -70,6 +72,23 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         return []
 
     def _fetch_news_eastmoney(self, symbol: str) -> list[NewsArticle]:
+        articles: list[NewsArticle] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        for page_index in range(1, self.eastmoney_max_pages + 1):
+            page_articles = self._fetch_news_eastmoney_page(symbol, page_index=page_index)
+            if not page_articles:
+                break
+            for article in page_articles:
+                key = (article.title, article.published_at, article.source)
+                if key in seen:
+                    continue
+                seen.add(key)
+                articles.append(article)
+
+        return articles
+
+    def _fetch_news_eastmoney_page(self, symbol: str, *, page_index: int) -> list[NewsArticle]:
         url = "https://search-api-web.eastmoney.com/search/jsonp"
         inner_param = {
             "uid": "",
@@ -82,8 +101,8 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
                 "cmsArticleWebOld": {
                     "searchScope": "default",
                     "sort": "default",
-                    "pageIndex": 1,
-                    "pageSize": 20,
+                    "pageIndex": page_index,
+                    "pageSize": self.eastmoney_page_size,
                     "preTag": "",
                     "postTag": "",
                 }
@@ -103,7 +122,13 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         if start < 0 or end <= start:
             raise ValueError("invalid eastmoney jsonp payload")
         payload = json.loads(text[start + 1 : end])
-        rows = payload.get("result", {}).get("cmsArticleWebOld", {}).get("list", [])
+        raw_articles = payload.get("result", {}).get("cmsArticleWebOld", [])
+        if isinstance(raw_articles, dict):
+            rows = raw_articles.get("list", [])
+        elif isinstance(raw_articles, list):
+            rows = raw_articles
+        else:
+            rows = []
 
         return [
             NewsArticle(
