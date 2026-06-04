@@ -106,6 +106,9 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
         "market-scoring",
         "report-summary",
     ]
+    market_scoring_calls = [task for label, task, _system in executor.calls if label == "market-scoring"]
+    assert len(market_scoring_calls) == 1
+    assert market_scoring_calls[0].count('"technical_snapshot"') == 1
     assert report.trade_date == date(2026, 5, 26)
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
     assert report.selected_stocks[0].technical_score == 91
@@ -273,6 +276,118 @@ def test_merge_stage_outputs_uses_only_market_scoring_and_keeps_top_ten() -> Non
     assert [item.technical_score for item in selected] == [96, 92, 90, 88, 84, 81, 77, 71, 67, 63]
     assert all(item.screen_pass_reasons == [] for item in selected)
     assert all(item.negative_news_flags == [] for item in selected)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_scores_each_allowed_symbol_in_a_separate_market_scoring_call() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","strategy_name":"B1",
+               "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]},
+              {"symbol":"000001","strategy_name":"B1",
+               "screen_pass_reasons":["volume expanded versus the recent average"],"risk_notes":[]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]},
+              {"symbol":"000001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]}
+            ],"partial_failures":[]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","technical_score":91,
+               "score_reasons":["trend is above the short and medium moving averages"],
+               "risk_notes":["watch for next-day follow-through"]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"000001","technical_score":83,
+               "score_reasons":["volume confirms the move"],
+               "risk_notes":[]}
+            ]}
+            """,
+            """
+            {"summary":"Selected candidates: 600001, 000001.",
+             "global_risk_disclaimer":"For research use only."}
+            """,
+        ]
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        technical_data=_FakeTechnicalAdapter(
+            {
+                "600001": {"symbol": "600001", "close": 12.36, "data_status": "ok"},
+                "000001": {"symbol": "000001", "close": 9.18, "data_status": "ok"},
+            }
+        ),
+    )
+
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
+
+    market_scoring_calls = [task for label, task, _system in executor.calls if label == "market-scoring"]
+
+    assert len(market_scoring_calls) == 2
+    assert '"symbol": "600001"' in market_scoring_calls[0]
+    assert '"symbol": "000001"' not in market_scoring_calls[0]
+    assert '"symbol": "000001"' in market_scoring_calls[1]
+    assert '"symbol": "600001"' not in market_scoring_calls[1]
+    assert [item.symbol for item in report.selected_stocks] == ["600001", "000001"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_skips_single_symbol_market_scoring_failures_and_records_partial_failures() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","strategy_name":"B1",
+               "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]},
+              {"symbol":"000001","strategy_name":"B1",
+               "screen_pass_reasons":["volume expanded versus the recent average"],"risk_notes":[]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]},
+              {"symbol":"000001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]}
+            ],"partial_failures":[]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","technical_score":91,
+               "score_reasons":["trend is above the short and medium moving averages"],
+               "risk_notes":["watch for next-day follow-through"]}
+            ]}
+            """,
+            """
+            {"items":[]}
+            """,
+            """
+            {"summary":"Selected candidates: 600001.",
+             "global_risk_disclaimer":"For research use only."}
+            """,
+        ]
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        technical_data=_FakeTechnicalAdapter(
+            {
+                "600001": {"symbol": "600001", "close": 12.36, "data_status": "ok"},
+                "000001": {"symbol": "000001", "close": 9.18, "data_status": "ok"},
+            }
+        ),
+    )
+
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
+
+    assert [item.symbol for item in report.selected_stocks] == ["600001"]
+    assert report.partial_failures == ["market scoring unavailable for 000001: expected exactly one scored item"]
 
 
 def test_orchestrator_stage_prompts_are_loaded_from_templates() -> None:
