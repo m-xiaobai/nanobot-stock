@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from typing import Any
 
@@ -40,6 +41,28 @@ class _FakeNewsAdapter:
         if isinstance(result, Exception):
             raise result
         return list(result)
+
+
+class _FakeTechnicalAdapter:
+    def __init__(self, snapshots_by_symbol: dict[str, dict[str, Any] | Exception]) -> None:
+        self._snapshots_by_symbol = snapshots_by_symbol
+        self.calls: list[tuple[list[str], int, object | None]] = []
+
+    def get_technical_snapshot(
+        self,
+        symbols: list[str],
+        lookback_days: int,
+        anchor_date: object | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        self.calls.append((list(symbols), lookback_days, anchor_date))
+        snapshots: dict[str, dict[str, Any]] = {}
+        for symbol in symbols:
+            result = self._snapshots_by_symbol.get(symbol)
+            if isinstance(result, Exception):
+                raise result
+            if result is not None:
+                snapshots[symbol] = dict(result)
+        return snapshots
 
 
 @pytest.mark.asyncio
@@ -86,6 +109,9 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
     assert report.trade_date == date(2026, 5, 26)
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
     assert report.selected_stocks[0].technical_score == 91
+    assert report.selected_stocks[0].screen_pass_reasons == []
+    assert report.selected_stocks[0].negative_news_flags == []
+    assert report.selected_stocks[0].risk_notes == ["watch for next-day follow-through"]
     assert report.summary.startswith("Selected candidates")
     assert report.global_risk_disclaimer == "For research use only."
 
@@ -198,14 +224,55 @@ def test_orchestrator_stage_prompts_define_roles_contracts_and_fail_safes() -> N
     assert '"candidate_articles"' in news_prompt
     assert '"decision":"PASS"' in news_prompt
 
-    assert "Task: Score the supplied candidate symbols" in scoring_prompt
+    assert "Task: Score the supplied candidate items" in scoring_prompt
+    assert "Apply the system scoring rubric to each item" in scoring_prompt
     assert '"technical_score":90' in scoring_prompt
-    assert "symbols=" in scoring_prompt
+    assert "items=" in scoring_prompt
 
     assert "Task: Produce the final report metadata" in summary_prompt
     assert '"global_risk_disclaimer"' in summary_prompt
     assert "selected=" in summary_prompt
     assert "excluded=" not in summary_prompt
+
+
+def test_merge_stage_outputs_uses_only_market_scoring_and_keeps_top_ten() -> None:
+    scoring_items = [
+        {
+            "symbol": f"{600000 + index:06d}",
+            "technical_score": score,
+            "score_reasons": [f"reason-{score}"],
+            "risk_notes": [f"risk-{score}"],
+        }
+        for index, score in enumerate([55, 92, 71, 88, 63, 77, 84, 96, 59, 81, 67, 90], start=1)
+    ]
+
+    selected = StockSelectionSubagentOrchestrator._merge_stage_outputs(
+        strategy_name="B1",
+        trade_date=date(2026, 5, 26),
+        screened=[
+            {"symbol": "placeholder", "strategy_name": "B1", "screen_pass_reasons": [], "risk_notes": []}
+        ],
+        news_items=[
+            {"symbol": "placeholder", "allowed": True, "negative_news_flags": [], "risk_notes": []}
+        ],
+        scoring_items=scoring_items,
+    )
+
+    assert [item.symbol for item in selected] == [
+        "600008",
+        "600002",
+        "600012",
+        "600004",
+        "600007",
+        "600010",
+        "600006",
+        "600003",
+        "600011",
+        "600005",
+    ]
+    assert [item.technical_score for item in selected] == [96, 92, 90, 88, 84, 81, 77, 71, 67, 63]
+    assert all(item.screen_pass_reasons == [] for item in selected)
+    assert all(item.negative_news_flags == [] for item in selected)
 
 
 def test_orchestrator_stage_prompts_are_loaded_from_templates() -> None:
@@ -224,10 +291,16 @@ def test_orchestrator_task_prompts_keep_hard_rules_out_of_user_layer() -> None:
     orchestrator = StockSelectionSubagentOrchestrator(executor=_FakeExecutor(responses=[]))
 
     screening_prompt = orchestrator._build_stock_screening_task("B1", date(2026, 5, 26))
+    scoring_prompt = orchestrator._build_market_scoring_task(
+        [{"symbol": "600001", "technical_snapshot": {"close": 12.3, "ma5": 12.1}}]
+    )
 
     assert "Role:" not in screening_prompt
     assert "Output must be valid JSON only." not in screening_prompt
     assert "Return JSON only." not in screening_prompt
+    assert "趋势结构" not in scoring_prompt
+    assert "0-25" not in scoring_prompt
+    assert "FILTER_OUT" not in scoring_prompt
 
 
 def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
@@ -239,9 +312,9 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
     summary_system = orchestrator._build_report_summary_system_prompt()
 
     assert "You are a specialized A-share screening analyst." in screening_system
-    assert "Fetch the full A-share stock universe from the MCP server" in screening_system
-    assert "mapped strategy skill" not in screening_system
-    assert "workspace skills" in screening_system
+    assert "Source-of-truth rules:" in screening_system
+    assert "dedicated MCP screening tool" in screening_system
+    assert "Completion rule:" in screening_system
 
     assert "You are a specialized A-share risk news analyst." in news_system
     assert "If news is unavailable" in news_system
@@ -249,6 +322,20 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
 
     assert "You are a specialized A-share technical scoring analyst." in scoring_system
     assert "technical_score must be an integer from 0 to 100" in scoring_system
+    assert "Scoring rubric:" in scoring_system
+    assert "trend structure: 0-25" in scoring_system
+    assert "range position: 0-10" in scoring_system
+    assert "volume-price confirmation: 0-20" in scoring_system
+    assert "short-term momentum: 0-10" in scoring_system
+    assert "MACD: 0-20" in scoring_system
+    assert "RSI: 0-10" in scoring_system
+    assert "risk penalty: 0 to -15" in scoring_system
+    assert "technical_score = trend + position + volume_price + momentum + macd + rsi + risk_penalty" in scoring_system
+    assert "Decision bands:" in scoring_system
+    assert "<40 => FILTER_OUT" in scoring_system
+    assert "40-54 => WEAK_PASS" in scoring_system
+    assert ">=55 => PASS" in scoring_system
+    assert "Do not invent your own scoring rubric" in scoring_system
 
     assert "You are a specialized A-share report summarizer." in summary_system
     assert "Do not invent extra fields" in summary_system
@@ -335,6 +422,145 @@ async def test_orchestrator_accepts_b2_strategy() -> None:
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
 
 
+def test_orchestrator_prepares_market_scoring_inputs_from_technical_adapter() -> None:
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=_FakeExecutor(responses=[]),
+        technical_data=_FakeTechnicalAdapter(
+            {
+                "600001": {
+                    "symbol": "600001",
+                    "close": 12.36,
+                    "ma5": 11.98,
+                    "data_status": "ok",
+                }
+            },
+        ),
+    )
+
+    items, failures = asyncio.run(
+        orchestrator._prepare_market_scoring_inputs(["600001"], date(2026, 5, 26))
+    )
+
+    assert failures == []
+    assert items == [
+        {
+            "symbol": "600001",
+            "technical_snapshot": {
+                "symbol": "600001",
+                "close": 12.36,
+                "ma5": 11.98,
+                "data_status": "ok",
+            },
+        }
+    ]
+
+
+def test_orchestrator_prepares_market_scoring_inputs_from_batch_technical_adapter() -> None:
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=_FakeExecutor(responses=[]),
+        technical_data=_FakeTechnicalAdapter(
+            {
+                "600001": {
+                    "symbol": "600001",
+                    "close": 12.36,
+                    "data_status": "ok",
+                },
+                "000001": {
+                    "symbol": "000001",
+                    "close": 9.18,
+                    "data_status": "ok",
+                },
+            },
+        ),
+    )
+
+    items, failures = asyncio.run(
+        orchestrator._prepare_market_scoring_inputs(["600001", "000001"], date(2026, 5, 26))
+    )
+
+    assert failures == []
+    assert items == [
+        {
+            "symbol": "600001",
+            "technical_snapshot": {
+                "symbol": "600001",
+                "close": 12.36,
+                "data_status": "ok",
+            },
+        },
+        {
+            "symbol": "000001",
+            "technical_snapshot": {
+                "symbol": "000001",
+                "close": 9.18,
+                "data_status": "ok",
+            },
+        },
+    ]
+    assert orchestrator.technical_data.calls == [
+        (["600001", "000001"], 60, date(2026, 5, 26))
+    ]
+
+
+def test_orchestrator_marks_missing_batch_snapshot_as_unavailable() -> None:
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=_FakeExecutor(responses=[]),
+        technical_data=_FakeTechnicalAdapter(
+            {
+                "600001": {
+                    "symbol": "600001",
+                    "close": 12.36,
+                    "data_status": "ok",
+                }
+            },
+        ),
+    )
+
+    items, failures = asyncio.run(
+        orchestrator._prepare_market_scoring_inputs(["600001", "000001"], date(2026, 5, 26))
+    )
+
+    assert failures == ["technical data unavailable for 000001: snapshot missing from batch response"]
+    assert items == [
+        {
+            "symbol": "600001",
+            "technical_snapshot": {
+                "symbol": "600001",
+                "close": 12.36,
+                "data_status": "ok",
+            },
+        },
+        {
+            "symbol": "000001",
+            "technical_snapshot": {
+                "symbol": "000001",
+                "data_status": "unavailable",
+                "reason": "technical data unavailable for 000001: snapshot missing from batch response",
+            },
+        },
+    ]
+
+
+def test_orchestrator_marks_missing_technical_adapter_as_unavailable() -> None:
+    orchestrator = StockSelectionSubagentOrchestrator(executor=_FakeExecutor(responses=[]))
+
+    items, failures = asyncio.run(
+        orchestrator._prepare_market_scoring_inputs(["600001"], date(2026, 5, 26))
+    )
+
+    assert failures == []
+    assert items == [
+        {
+            "symbol": "600001",
+            "technical_snapshot": {
+                "symbol": "600001",
+                "data_status": "unavailable",
+                "reason": "technical data adapter not configured",
+            },
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_accepts_expanded_news_filter_contract_and_preserves_failures() -> None:
     executor = _FakeExecutor(
@@ -380,8 +606,8 @@ async def test_orchestrator_accepts_expanded_news_filter_contract_and_preserves_
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
-    assert report.selected_stocks[0].negative_news_flags == ["minor litigation review"]
-    assert "recent negative headlines need manual attention" in report.selected_stocks[0].risk_notes
+    assert report.selected_stocks[0].negative_news_flags == []
+    assert report.selected_stocks[0].risk_notes == []
     assert report.partial_failures == ["news source timeout for 000001"]
 
 

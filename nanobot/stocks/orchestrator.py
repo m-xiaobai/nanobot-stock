@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import date
@@ -39,12 +40,22 @@ class InlineSubagentExecutor(Protocol):
     ) -> str: ...
 
 
+class TechnicalDataAdapter(Protocol):
+    def get_technical_snapshot(
+        self,
+        symbols: list[str],
+        lookback_days: int,
+        anchor_date: date | None = None,
+    ) -> dict[str, dict[str, Any]]: ...
+
+
 @dataclass
 class StockSelectionSubagentOrchestrator:
     """Run the stock report workflow through isolated subagent stages."""
 
     executor: InlineSubagentExecutor
     news_data: NewsDataAdapter | None = None
+    technical_data: TechnicalDataAdapter | None = None
     market: str = "A"
     workspace: Path = Path(".")
     screening_only: bool = False
@@ -87,12 +98,15 @@ class StockSelectionSubagentOrchestrator:
                 news_items=news_items,
                 partial_failures=partial_failures,
             )
+        scoring_items, scoring_failures = await self._prepare_market_scoring_inputs(
+            [item["symbol"] for item in news_items if item["allowed"]],
+            trade_date=trade_date,
+        )
+        partial_failures.extend(scoring_failures)
         scoring = await self._run_json_stage(
             label="market-scoring",
             stage="market-scoring",
-            task=self._build_market_scoring_task(
-                [item["symbol"] for item in news_items if item["allowed"]]
-            ),
+            task=self._build_market_scoring_task(scoring_items),
         )
 
         selected_stocks = self._merge_stage_outputs(
@@ -289,6 +303,13 @@ class StockSelectionSubagentOrchestrator:
             lookback_days=self.lookback_days,
         )
 
+    def _build_market_scoring_task(self, items: list[dict[str, Any]]) -> str:
+        return render_template(
+            "stocks/tasks/market_scoring.md",
+            strip=True,
+            items_json=json.dumps(items, ensure_ascii=False),
+        )
+
     async def _review_news_candidates(
         self,
         review_items: list[dict[str, Any]],
@@ -378,6 +399,74 @@ class StockSelectionSubagentOrchestrator:
 
         return review_items, auto_allowed_items, partial_failures
 
+    async def _prepare_market_scoring_inputs(
+        self,
+        symbols: list[str],
+        trade_date: date | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        scoring_items: list[dict[str, Any]] = []
+        partial_failures: list[str] = []
+
+        if self.technical_data is None:
+            technical_snapshots: dict[str, dict[str, Any]] | None = None
+        else:
+            try:
+                batch_result = await asyncio.to_thread(
+                    self.technical_data.get_technical_snapshot,
+                    symbols,
+                    60,
+                    trade_date,
+                )
+                if not isinstance(batch_result, dict):
+                    raise TypeError("batch technical snapshot response must be a JSON object")
+                technical_snapshots = {
+                    str(key): value
+                    for key, value in batch_result.items()
+                    if isinstance(key, str) and isinstance(value, dict)
+                }
+            except Exception as exc:
+                technical_snapshots = {}
+                message = f"technical data unavailable for batch {symbols}: {exc}"
+                partial_failures.append(message)
+
+        for symbol in symbols:
+            technical_snapshot: dict[str, Any]
+            if self.technical_data is None:
+                technical_snapshot = self._build_unavailable_technical_snapshot(
+                    symbol,
+                    "technical data adapter not configured",
+                )
+            else:
+                technical_snapshot = technical_snapshots.get(symbol) if technical_snapshots is not None else None
+                if technical_snapshot is None:
+                    if partial_failures and partial_failures[-1].startswith("technical data unavailable for batch "):
+                        message = f"technical data unavailable for {symbol}: batch request failed"
+                    else:
+                        message = (
+                            f"technical data unavailable for {symbol}: "
+                            "snapshot missing from batch response"
+                        )
+                    if message not in partial_failures:
+                        partial_failures.append(message)
+                    technical_snapshot = self._build_unavailable_technical_snapshot(symbol, message)
+
+            scoring_items.append(
+                {
+                    "symbol": symbol,
+                    "technical_snapshot": technical_snapshot,
+                }
+            )
+
+        return scoring_items, partial_failures
+
+    @staticmethod
+    def _build_unavailable_technical_snapshot(symbol: str, reason: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "data_status": "unavailable",
+            "reason": reason,
+        }
+
     @staticmethod
     def _candidate_article_to_dict(article: CandidateArticle) -> dict[str, Any]:
         return {
@@ -387,13 +476,6 @@ class StockSelectionSubagentOrchestrator:
             "candidate_categories": list(article.candidate_categories),
             "rule_severity": article.rule_severity,
         }
-
-    def _build_market_scoring_task(self, symbols: list[str]) -> str:
-        return render_template(
-            "stocks/tasks/market_scoring.md",
-            strip=True,
-            symbols_json=json.dumps(symbols, ensure_ascii=False),
-        )
 
     def _build_report_summary_task(self, selected_symbols: list[str]) -> str:
         return render_template(
@@ -411,33 +493,10 @@ class StockSelectionSubagentOrchestrator:
         news_items: list[dict[str, Any]],
         scoring_items: list[dict[str, Any]],
     ) -> list[SelectedStockReport]:
-        news_by_symbol = {str(item["symbol"]): item for item in news_items}
-        scoring_by_symbol = {str(item["symbol"]): item for item in scoring_items}
+        del screened, news_items
         selected: list[SelectedStockReport] = []
 
-        for item in screened:
-            screen = ScreeningResult(
-                symbol=str(item["symbol"]),
-                strategy_name=str(item.get("strategy_name") or strategy_name),
-                screen_pass_reasons=[str(reason) for reason in item.get("screen_pass_reasons", [])],
-                risk_notes=[str(note) for note in item.get("risk_notes", [])],
-            )
-
-            news_raw = news_by_symbol.get(screen.symbol)
-            if news_raw is None:
-                continue
-            news = NewsFilteredStock(
-                symbol=str(news_raw["symbol"]),
-                allowed=bool(news_raw["allowed"]),
-                negative_news_flags=[str(flag) for flag in news_raw.get("negative_news_flags", [])],
-                risk_notes=[str(note) for note in news_raw.get("risk_notes", [])],
-            )
-            if not news.allowed:
-                continue
-
-            scoring_raw = scoring_by_symbol.get(screen.symbol)
-            if scoring_raw is None:
-                continue
+        for scoring_raw in scoring_items:
             scoring = ScoredStock(
                 symbol=str(scoring_raw["symbol"]),
                 technical_score=int(scoring_raw["technical_score"]),
@@ -446,16 +505,16 @@ class StockSelectionSubagentOrchestrator:
             )
             selected.append(
                 SelectedStockReport(
-                    symbol=screen.symbol,
-                    strategy_name=screen.strategy_name,
-                    screen_pass_reasons=screen.screen_pass_reasons,
-                    negative_news_flags=news.negative_news_flags,
+                    symbol=scoring.symbol,
+                    strategy_name=strategy_name,
+                    screen_pass_reasons=[],
+                    negative_news_flags=[],
                     technical_score=scoring.technical_score,
                     score_reasons=scoring.score_reasons,
-                    risk_notes=[*screen.risk_notes, *news.risk_notes, *scoring.risk_notes],
+                    risk_notes=scoring.risk_notes,
                     report_date=trade_date,
                 )
             )
 
         selected.sort(key=lambda item: (-item.technical_score, item.symbol))
-        return selected
+        return selected[:10]
