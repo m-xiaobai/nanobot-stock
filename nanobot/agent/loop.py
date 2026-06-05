@@ -44,6 +44,7 @@ from nanobot.session.webui_turns import (
 )
 from nanobot.stocks.orchestrator import StockSelectionSubagentOrchestrator
 from nanobot.stocks.real_news_adapter import EastmoneySinaNewsAdapter
+from nanobot.stocks.technical_data_adapter import MCPTechnicalDataAdapter
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -270,7 +271,11 @@ class AgentLoop:
         )
         self.stock_selection_orchestrator = StockSelectionSubagentOrchestrator(
             executor=self.subagents,
-            news_data=None,
+            news_data=EastmoneySinaNewsAdapter(),
+            technical_data=MCPTechnicalDataAdapter(
+                server_name="stocks",
+                tool_registry=self.tools,
+            ),
             workspace=workspace,
             screening_only=False,
             news_filter_only=True,
