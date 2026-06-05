@@ -273,7 +273,7 @@ class AgentLoop:
             executor=self.subagents,
             news_data=EastmoneySinaNewsAdapter(),
             technical_data=MCPTechnicalDataAdapter(
-                server_name="stocks",
+                server_name="mcp-stock-server",
                 tool_registry=self.tools,
             ),
             workspace=workspace,
