@@ -77,29 +77,32 @@ class StockSelectionSubagentOrchestrator:
                 trade_date=trade_date,
                 screened=screened["items"],
             )
-        review_items, auto_allowed_items, prescreen_failures = self._prepare_news_filter_inputs(
-            [str(item["symbol"]) for item in screened["items"]],
-            trade_date=trade_date,
-        )
-        reviewed_items: list[dict[str, Any]] = []
-        reviewed_failures: list[str] = []
-        if review_items:
-            reviewed_items, reviewed_failures = await self._review_news_candidates(review_items)
-        news_items = [*auto_allowed_items, *reviewed_items]
-        partial_failures = [
-            *[str(item) for item in prescreen_failures],
-            *[str(item) for item in reviewed_failures],
-        ]
-        if self.news_filter_only:
-            return self._build_news_filter_only_report(
-                strategy_name=strategy_name,
-                trade_date=trade_date,
-                screened=screened["items"],
-                news_items=news_items,
-                partial_failures=partial_failures,
-            )
+        partial_failures: list[str] = []
+        # Temporarily disable the news-filter stage and pass stock-screening
+        # results directly into market-scoring.
+        # review_items, auto_allowed_items, prescreen_failures = self._prepare_news_filter_inputs(
+        #     [str(item["symbol"]) for item in screened["items"]],
+        #     trade_date=trade_date,
+        # )
+        # reviewed_items: list[dict[str, Any]] = []
+        # reviewed_failures: list[str] = []
+        # if review_items:
+        #     reviewed_items, reviewed_failures = await self._review_news_candidates(review_items)
+        # news_items = [*auto_allowed_items, *reviewed_items]
+        # partial_failures = [
+        #     *[str(item) for item in prescreen_failures],
+        #     *[str(item) for item in reviewed_failures],
+        # ]
+        # if self.news_filter_only:
+        #     return self._build_news_filter_only_report(
+        #         strategy_name=strategy_name,
+        #         trade_date=trade_date,
+        #         screened=screened["items"],
+        #         news_items=news_items,
+        #         partial_failures=partial_failures,
+        #     )
         scoring_items, scoring_failures = await self._prepare_market_scoring_inputs(
-            [item["symbol"] for item in news_items if item["allowed"]],
+            [str(item["symbol"]) for item in screened["items"] if item.get("symbol")],
             trade_date=trade_date,
         )
         partial_failures.extend(scoring_failures)
@@ -110,7 +113,7 @@ class StockSelectionSubagentOrchestrator:
             strategy_name=strategy_name,
             trade_date=trade_date,
             screened=screened["items"],
-            news_items=news_items,
+            news_items=[],
             scoring_items=scored_items,
         )
 
@@ -131,7 +134,7 @@ class StockSelectionSubagentOrchestrator:
             selected_stocks=selected_stocks,
             summary=(
                 f"Market-scoring completed: {len(selected_stocks)} stock(s) selected "
-                "after stock-screening, news-filter, and market-scoring."
+                "after stock-screening and market-scoring."
             ),
             global_risk_disclaimer=(
                 "For research use only. This report is not investment advice."
