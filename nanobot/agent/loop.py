@@ -270,7 +270,7 @@ class AgentLoop:
         )
         self.stock_selection_orchestrator = StockSelectionSubagentOrchestrator(
             executor=self.subagents,
-            news_data=EastmoneySinaNewsAdapter(),
+            news_data=None,
             workspace=workspace,
             screening_only=False,
             news_filter_only=True,

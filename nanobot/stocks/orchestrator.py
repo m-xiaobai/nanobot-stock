@@ -114,21 +114,28 @@ class StockSelectionSubagentOrchestrator:
             scoring_items=scored_items,
         )
 
-        summary_payload = await self._run_json_stage(
-            label="report-summary",
-            stage="report-summary",
-            task=self._build_report_summary_task(
-                [stock.symbol for stock in selected_stocks],
-            ),
-        )
+        # Temporarily disable the report-summary stage and return directly
+        # after market-scoring completes.
+        # summary_payload = await self._run_json_stage(
+        #     label="report-summary",
+        #     stage="report-summary",
+        #     task=self._build_report_summary_task(
+        #         [stock.symbol for stock in selected_stocks],
+        #     ),
+        # )
 
         return DailySelectionReport(
             trade_date=trade_date,
             strategy_name=strategy_name,
             market=self.market,
             selected_stocks=selected_stocks,
-            summary=str(summary_payload["summary"]),
-            global_risk_disclaimer=str(summary_payload["global_risk_disclaimer"]),
+            summary=(
+                f"Market-scoring completed: {len(selected_stocks)} stock(s) selected "
+                "after stock-screening, news-filter, and market-scoring."
+            ),
+            global_risk_disclaimer=(
+                "For research use only. This report is not investment advice."
+            ),
             partial_failures=partial_failures,
         )
 
