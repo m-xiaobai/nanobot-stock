@@ -173,6 +173,52 @@ async def test_run_inline_supports_stage_specific_system_prompt(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_inline_lightweight_mode_uses_minimal_system_prompt_and_no_tools(tmp_path):
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+
+    seen = {}
+
+    async def fake_run(spec):
+        seen["messages"] = spec.initial_messages
+        seen["tool_names"] = list(spec.tools.tool_names)
+        return SimpleNamespace(
+            stop_reason="done",
+            final_content='{"ok":true}',
+            error=None,
+            tool_events=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+
+    result = await mgr.run_inline(
+        task='items=[{"symbol":"600001","technical_snapshot":{"close":12.3}}]',
+        label="market-scoring",
+        extra_system_prompt="只根据提供的technical_snapshot评分并返回JSON。",
+        allow_builtin_tools=False,
+        allow_mcp_tools=False,
+        use_lightweight_system_prompt=True,
+    )
+
+    assert result == '{"ok":true}'
+    assert seen["messages"][0]["role"] == "system"
+    assert seen["messages"][0]["content"] == "只根据提供的technical_snapshot评分并返回JSON。"
+    assert "## Skills" not in seen["messages"][0]["content"]
+    assert seen["messages"][1]["role"] == "user"
+    assert seen["tool_names"] == []
+
+
+@pytest.mark.asyncio
 async def test_spawn_tool_rejects_when_at_concurrency_limit(tmp_path):
     """SpawnTool should return an error string when the concurrency limit is reached."""
     from nanobot.agent.subagent import SubagentManager

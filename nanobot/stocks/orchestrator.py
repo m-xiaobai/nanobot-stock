@@ -37,6 +37,9 @@ class InlineSubagentExecutor(Protocol):
         label: str,
         temperature: float | None = None,
         extra_system_prompt: str | None = None,
+        allow_builtin_tools: bool = True,
+        allow_mcp_tools: bool = True,
+        use_lightweight_system_prompt: bool = False,
     ) -> str: ...
 
 
@@ -130,11 +133,10 @@ class StockSelectionSubagentOrchestrator:
             market=self.market,
             selected_stocks=selected_stocks,
             summary=(
-                f"Market-scoring completed: {len(selected_stocks)} stock(s) selected "
-                "after stock-screening and market-scoring."
+                f"市场评分已完成，共选出 {len(selected_stocks)} 只股票。"
             ),
             global_risk_disclaimer=(
-                "For research use only. This report is not investment advice."
+                "仅供研究参考，不构成任何投资建议。"
             ),
             partial_failures=[],
         )
@@ -145,7 +147,9 @@ class StockSelectionSubagentOrchestrator:
             label=label,
             temperature=0.0,
             extra_system_prompt=self._build_stage_system_prompt(stage),
+            allow_builtin_tools=stage != "market-scoring",
             allow_mcp_tools=stage != "market-scoring",
+            use_lightweight_system_prompt=stage == "market-scoring",
         )
         parsed = self._extract_json(raw, stage)
         if not isinstance(parsed, dict):
@@ -207,9 +211,9 @@ class StockSelectionSubagentOrchestrator:
             strategy_name=strategy_name,
             market=self.market,
             selected_stocks=selected,
-            summary=f"Screening-only mode: {len(selected)} candidate(s) passed stock-screening.",
+            summary=f"仅执行股票筛选阶段，共有 {len(selected)} 只候选标的通过。",
             global_risk_disclaimer=(
-                "For research use only. This screening-only report is not investment advice."
+                "仅供研究参考，本筛选结果不构成任何投资建议。"
             ),
             partial_failures=[],
         )
@@ -254,11 +258,10 @@ class StockSelectionSubagentOrchestrator:
             market=self.market,
             selected_stocks=selected,
             summary=(
-                f"News-filter-only mode: {len(selected)} candidate(s) passed stock-screening "
-                "and news-filter."
+                f"仅执行筛选与新闻过滤阶段，共有 {len(selected)} 只候选标的通过。"
             ),
             global_risk_disclaimer=(
-                "For research use only. This news-filter-only report is not investment advice."
+                "仅供研究参考，本结果不构成任何投资建议。"
             ),
             partial_failures=[],
         )
@@ -480,14 +483,31 @@ class StockSelectionSubagentOrchestrator:
                         partial_failures.append(message)
                     technical_snapshot = self._build_unavailable_technical_snapshot(symbol, message)
 
+            scoring_snapshot = self._flatten_scoring_snapshot(technical_snapshot)
             scoring_items.append(
                 {
                     "symbol": symbol,
-                    "technical_snapshot": technical_snapshot,
+                    "technical_snapshot": scoring_snapshot,
                 }
             )
 
         return scoring_items, partial_failures
+
+    @staticmethod
+    def _flatten_scoring_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Reduce adapter payloads to the scoring fields the LLM actually needs."""
+        inner = snapshot.get("technical_snapshot")
+        if isinstance(inner, dict):
+            flattened = dict(inner)
+            # Preserve error/status metadata that may live on the wrapper object.
+            if "data_status" in snapshot and "data_status" not in flattened:
+                flattened["data_status"] = snapshot["data_status"]
+            if "reason" in snapshot and "reason" not in flattened:
+                flattened["reason"] = snapshot["reason"]
+            if "symbol" in snapshot and "symbol" not in flattened:
+                flattened["symbol"] = snapshot["symbol"]
+            return flattened
+        return snapshot
 
     @staticmethod
     def _build_unavailable_technical_snapshot(symbol: str, reason: str) -> dict[str, Any]:

@@ -13,7 +13,7 @@ from nanobot.stocks.service import DailySelectionServiceError, NewsArticle
 class _FakeExecutor:
     def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
-        self.calls: list[tuple[str, str, str | None]] = []
+        self.calls: list[tuple[str, str, str | None, bool, bool, bool]] = []
 
     async def run_inline(
         self,
@@ -22,10 +22,21 @@ class _FakeExecutor:
         label: str,
         temperature: float | None = None,
         extra_system_prompt: str | None = None,
+        allow_builtin_tools: bool = True,
         allow_mcp_tools: bool = True,
+        use_lightweight_system_prompt: bool = False,
     ) -> str:
-        del temperature, allow_mcp_tools
-        self.calls.append((label, task, extra_system_prompt))
+        del temperature
+        self.calls.append(
+            (
+                label,
+                task,
+                extra_system_prompt,
+                allow_builtin_tools,
+                allow_mcp_tools,
+                use_lightweight_system_prompt,
+            )
+        )
         if not self._responses:
             raise AssertionError("unexpected subagent invocation")
         return self._responses.pop(0)
@@ -101,23 +112,30 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
 
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
-    assert [label for label, _task, _system in executor.calls] == [
+    assert [label for label, _task, _system, _builtin, _mcp, _light in executor.calls] == [
         "stock-screening",
         "news-filter",
         "market-scoring",
         "report-summary",
     ]
-    market_scoring_calls = [task for label, task, _system in executor.calls if label == "market-scoring"]
+    market_scoring_calls = [
+        (task, allow_builtin_tools, allow_mcp_tools, use_lightweight_system_prompt)
+        for label, task, _system, allow_builtin_tools, allow_mcp_tools, use_lightweight_system_prompt in executor.calls
+        if label == "market-scoring"
+    ]
     assert len(market_scoring_calls) == 1
-    assert market_scoring_calls[0].count('"technical_snapshot"') == 1
+    assert market_scoring_calls[0][0].count('"technical_snapshot"') == 1
+    assert market_scoring_calls[0][1] is False
+    assert market_scoring_calls[0][2] is False
+    assert market_scoring_calls[0][3] is True
     assert report.trade_date == date(2026, 5, 26)
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
     assert report.selected_stocks[0].technical_score == 91
     assert report.selected_stocks[0].screen_pass_reasons == []
     assert report.selected_stocks[0].negative_news_flags == []
     assert report.selected_stocks[0].risk_notes == ["watch for next-day follow-through"]
-    assert report.summary.startswith("Selected candidates")
-    assert report.global_risk_disclaimer == "For research use only."
+    assert report.summary.startswith("市场评分已完成")
+    assert report.global_risk_disclaimer == "仅供研究参考，不构成任何投资建议。"
 
 
 @pytest.mark.asyncio
@@ -212,7 +230,9 @@ def test_orchestrator_stage_prompts_define_roles_contracts_and_fail_safes() -> N
     news_prompt = orchestrator._build_news_filter_task(
         [{"symbol": "600001", "candidate_articles": []}]
     )
-    scoring_prompt = orchestrator._build_market_scoring_task(["600001"])
+    scoring_prompt = orchestrator._build_market_scoring_task(
+        [{"symbol": "600001", "technical_snapshot": {"close": 12.3, "ma5": 12.1}}]
+    )
     summary_prompt = orchestrator._build_report_summary_task(["600001"])
 
     assert "Task: Execute the stock screening run" in screening_prompt
@@ -228,10 +248,10 @@ def test_orchestrator_stage_prompts_define_roles_contracts_and_fail_safes() -> N
     assert '"candidate_articles"' in news_prompt
     assert '"decision":"PASS"' in news_prompt
 
-    assert "Task: Score the supplied candidate items" in scoring_prompt
-    assert "Apply the system scoring rubric to each item" in scoring_prompt
-    assert '"technical_score":90' in scoring_prompt
+    assert "技术评分" in scoring_prompt
     assert "items=" in scoring_prompt
+    assert "Output contract" not in scoring_prompt
+    assert "Apply the system scoring rubric" not in scoring_prompt
 
     assert "Task: Produce the final report metadata" in summary_prompt
     assert '"global_risk_disclaimer"' in summary_prompt

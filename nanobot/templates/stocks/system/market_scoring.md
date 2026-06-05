@@ -4,6 +4,9 @@
 只对提供给你的候选标的进行评分。
 `technical_score` 必须是 0 到 100 的整数。
 `score_reasons` 使用简洁、客观的事实描述；`risk_notes` 只用于记录技术脆弱性或确认不足。
+`score_reasons` 和 `risk_notes` 必须使用简体中文输出。
+除非必须引用原始字段名或阈值，否则不要输出英文句子。
+如需引用字段名，请优先使用中文描述，必要时再在括号中补充原始字段名。
 只能使用提供给你的 `technical_snapshot`。
 本阶段禁止调用 MCP 工具、web 工具或任何外部数据源。
 不要虚构缺失的市场数据。
@@ -103,3 +106,4 @@ technical_score = trend + position + volume_price + momentum + macd + rsi + risk
 - 本阶段任何工具调用都属于 policy violation；只能基于提供的 snapshot 评分。
 - 不要自行发明新的评分体系。
 - 不要引入新闻、基本面、宏观、板块轮动或 snapshot 之外的主观叙事。
+- 输出中的结论、原因、风险说明必须全部使用简体中文；避免中英混杂。

@@ -116,11 +116,15 @@ class SubagentManager:
         self,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        allow_builtin_tools: bool = True,
         allow_mcp_tools: bool = True,
     ) -> ToolRegistry:
         """Build an isolated subagent tool registry via ToolLoader."""
-        root = self.workspace if workspace is None else workspace
         registry = ToolRegistry()
+        if not allow_builtin_tools:
+            return registry
+
+        root = self.workspace if workspace is None else workspace
         cfg = tools_config if tools_config is not None else self._subagent_tools_config()
         ctx = ToolContext(
             config=cfg,
@@ -150,14 +154,22 @@ class SubagentManager:
         label: str,
         temperature: float | None = None,
         extra_system_prompt: str | None = None,
+        allow_builtin_tools: bool = True,
         allow_mcp_tools: bool = True,
+        use_lightweight_system_prompt: bool = False,
     ) -> str:
         """Run a subagent task inline and return the final content."""
-        tools = self._build_tools(allow_mcp_tools=allow_mcp_tools)
-        system_prompt = self._build_subagent_prompt()
-        merged_system = system_prompt
-        if extra_system_prompt:
-            merged_system = f"{system_prompt.rstrip()}\n\n{extra_system_prompt.strip()}"
+        tools = self._build_tools(
+            allow_builtin_tools=allow_builtin_tools,
+            allow_mcp_tools=allow_mcp_tools,
+        )
+        if use_lightweight_system_prompt:
+            merged_system = (extra_system_prompt or "").strip()
+        else:
+            system_prompt = self._build_subagent_prompt()
+            merged_system = system_prompt
+            if extra_system_prompt:
+                merged_system = f"{system_prompt.rstrip()}\n\n{extra_system_prompt.strip()}"
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": merged_system},
             {"role": "user", "content": task},

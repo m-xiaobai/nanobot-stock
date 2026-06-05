@@ -622,24 +622,24 @@ def _parse_stock_report_args(raw_args: str) -> tuple[str, date]:
 
 def _render_stock_report(report) -> str:
     lines = [
-        "## Stock Report",
-        f"- Strategy: `{report.strategy_name}`",
-        f"- Trade date: `{report.trade_date.isoformat()}`",
-        f"- Market: `{report.market}`",
+        "## 选股报告",
+        f"- 策略: `{report.strategy_name}`",
+        f"- 交易日: `{report.trade_date.isoformat()}`",
+        f"- 市场: `{report.market}`",
         "",
-        "### Selected",
+        "### 入选标的",
     ]
     if report.selected_stocks:
         for stock in report.selected_stocks:
-            lines.append(f"- `{stock.symbol}` score `{stock.technical_score}`")
-            lines.append(f"  screen: {', '.join(stock.screen_pass_reasons) or 'n/a'}")
-            lines.append(f"  score: {', '.join(stock.score_reasons) or 'n/a'}")
+            lines.append(f"- `{stock.symbol}` 分数 `{stock.technical_score}`")
+            lines.append(f"  筛选: {', '.join(stock.screen_pass_reasons) or '无'}")
+            lines.append(f"  评分: {', '.join(stock.score_reasons) or '无'}")
             if stock.risk_notes:
-                lines.append(f"  risks: {', '.join(stock.risk_notes)}")
+                lines.append(f"  风险: {', '.join(stock.risk_notes)}")
     else:
-        lines.append("- none")
-    lines.extend(["", "### Summary", report.summary])
-    lines.extend(["", "### Disclaimer", report.global_risk_disclaimer])
+        lines.append("- 无")
+    lines.extend(["", "### 总结", report.summary])
+    lines.extend(["", "### 免责声明", report.global_risk_disclaimer])
     return "\n".join(lines)
 
 
