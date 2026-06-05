@@ -77,7 +77,6 @@ class StockSelectionSubagentOrchestrator:
                 trade_date=trade_date,
                 screened=screened["items"],
             )
-        partial_failures: list[str] = []
         # Temporarily disable the news-filter stage and pass stock-screening
         # results directly into market-scoring.
         # review_items, auto_allowed_items, prescreen_failures = self._prepare_news_filter_inputs(
@@ -101,13 +100,11 @@ class StockSelectionSubagentOrchestrator:
         #         news_items=news_items,
         #         partial_failures=partial_failures,
         #     )
-        scoring_items, scoring_failures = await self._prepare_market_scoring_inputs(
+        scoring_items, _ = await self._prepare_market_scoring_inputs(
             [str(item["symbol"]) for item in screened["items"] if item.get("symbol")],
             trade_date=trade_date,
         )
-        partial_failures.extend(scoring_failures)
-        scored_items, scoring_stage_failures = await self._score_market_items_individually(scoring_items)
-        partial_failures.extend(scoring_stage_failures)
+        scored_items, _ = await self._score_market_items_individually(scoring_items)
 
         selected_stocks = self._merge_stage_outputs(
             strategy_name=strategy_name,
@@ -139,7 +136,7 @@ class StockSelectionSubagentOrchestrator:
             global_risk_disclaimer=(
                 "For research use only. This report is not investment advice."
             ),
-            partial_failures=partial_failures,
+            partial_failures=[],
         )
 
     async def _run_json_stage(self, *, label: str, stage: str, task: str) -> dict[str, Any]:
@@ -148,6 +145,7 @@ class StockSelectionSubagentOrchestrator:
             label=label,
             temperature=0.0,
             extra_system_prompt=self._build_stage_system_prompt(stage),
+            allow_mcp_tools=stage != "market-scoring",
         )
         parsed = self._extract_json(raw, stage)
         if not isinstance(parsed, dict):
@@ -213,9 +211,7 @@ class StockSelectionSubagentOrchestrator:
             global_risk_disclaimer=(
                 "For research use only. This screening-only report is not investment advice."
             ),
-            partial_failures=[
-                "screening_only mode enabled; skipped news-filter, market-scoring, report-summary"
-            ],
+            partial_failures=[],
         )
 
     def _build_news_filter_only_report(
@@ -264,10 +260,7 @@ class StockSelectionSubagentOrchestrator:
             global_risk_disclaimer=(
                 "For research use only. This news-filter-only report is not investment advice."
             ),
-            partial_failures=[
-                *partial_failures,
-                "news_filter_only mode enabled; skipped market-scoring, report-summary",
-            ],
+            partial_failures=[],
         )
 
     def _build_stage_system_prompt(self, stage: str) -> str:

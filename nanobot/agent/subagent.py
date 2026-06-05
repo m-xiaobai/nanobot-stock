@@ -116,6 +116,7 @@ class SubagentManager:
         self,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        allow_mcp_tools: bool = True,
     ) -> ToolRegistry:
         """Build an isolated subagent tool registry via ToolLoader."""
         root = self.workspace if workspace is None else workspace
@@ -127,7 +128,8 @@ class SubagentManager:
             file_state_store=FileStates(),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
-        self._register_shared_mcp_tools(registry)
+        if allow_mcp_tools:
+            self._register_shared_mcp_tools(registry)
         return registry
 
     def _register_shared_mcp_tools(self, registry: ToolRegistry) -> None:
@@ -148,9 +150,10 @@ class SubagentManager:
         label: str,
         temperature: float | None = None,
         extra_system_prompt: str | None = None,
+        allow_mcp_tools: bool = True,
     ) -> str:
         """Run a subagent task inline and return the final content."""
-        tools = self._build_tools()
+        tools = self._build_tools(allow_mcp_tools=allow_mcp_tools)
         system_prompt = self._build_subagent_prompt()
         merged_system = system_prompt
         if extra_system_prompt:

@@ -91,6 +91,27 @@ async def test_stock_report_command_runs_service_and_formats_report() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stock_report_command_hides_partial_failures_section() -> None:
+    report = DailySelectionReport(
+        trade_date=date(2026, 5, 26),
+        strategy_name="B1",
+        market="A",
+        selected_stocks=[],
+        summary="1 candidate selected.",
+        global_risk_disclaimer="For research use only.",
+        partial_failures=["technical data unavailable for 000029: batch request failed"],
+    )
+    service = _FakeService(report)
+
+    out = await cmd_stock_report(
+        _ctx("/stock-report B1 2026-05-26", args="B1 2026-05-26", service=service)
+    )
+
+    assert "### Partial Failures" not in out.content
+    assert "technical data unavailable for 000029: batch request failed" not in out.content
+
+
+@pytest.mark.asyncio
 async def test_stock_report_command_prefers_async_orchestrator_when_present() -> None:
     report = DailySelectionReport(
         trade_date=date(2026, 5, 26),

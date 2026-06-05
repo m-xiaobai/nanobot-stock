@@ -22,8 +22,9 @@ class _FakeExecutor:
         label: str,
         temperature: float | None = None,
         extra_system_prompt: str | None = None,
+        allow_mcp_tools: bool = True,
     ) -> str:
-        del temperature
+        del temperature, allow_mcp_tools
         self.calls.append((label, task, extra_system_prompt))
         if not self._responses:
             raise AssertionError("unexpected subagent invocation")

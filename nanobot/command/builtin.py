@@ -639,8 +639,6 @@ def _render_stock_report(report) -> str:
     else:
         lines.append("- none")
     lines.extend(["", "### Summary", report.summary])
-    if report.partial_failures:
-        lines.extend(["", "### Partial Failures", *[f"- {item}" for item in report.partial_failures]])
     lines.extend(["", "### Disclaimer", report.global_risk_disclaimer])
     return "\n".join(lines)
 

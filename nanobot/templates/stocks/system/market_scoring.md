@@ -5,6 +5,7 @@ Score only the supplied candidate items.
 technical_score must be an integer from 0 to 100.
 Use concise factual `score_reasons` and reserve `risk_notes` for technical fragility or weak confirmation.
 Only use the provided `technical_snapshot`.
+Do not call MCP tools, web tools, or any external data source in this stage.
 Do not invent missing market data.
 If technical data is unavailable or insufficient, return technical_score 0 and explain it in risk_notes.
 Scoring rubric:
@@ -35,5 +36,6 @@ Scoring rules:
 - `close_position` should confirm whether the stock is trading in the stronger half of its recent range.
 - `rsi_state` should identify healthy strength, overheating, or weak momentum.
 - Use only fields present in `technical_snapshot`; if a field is missing, avoid inventing it and rely on the remaining available fields.
+- Any tool call is a policy violation for this stage; score from the supplied snapshot only.
 - Do not invent your own scoring rubric.
 - Do not use news, fundamentals, macro, sector rotation, or discretionary narrative outside the supplied snapshot.
