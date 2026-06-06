@@ -25,8 +25,10 @@ from nanobot.utils.prompt_templates import render_template
 
 try:
     from langfuse.decorators import langfuse_context
+    from langfuse.utils import propagate_attributes
 except Exception:  # pragma: no cover - optional dependency
     langfuse_context = None
+    propagate_attributes = None
 
 
 _SUPPORTED_STRATEGIES = {
@@ -76,88 +78,89 @@ class StockSelectionSubagentOrchestrator:
             raise DailySelectionServiceError(f"unknown strategy: {strategy_name}")
 
         session_id = self._build_langfuse_session_id(strategy_name, trade_date, self.market)
-        input_payload = {
-            "strategy_name": strategy_name,
-            "trade_date": trade_date.isoformat(),
-            "market": self.market,
-        }
-        self._update_langfuse_root_trace(session_id=session_id, input_payload=input_payload)
-
         with self._langfuse_span("run_daily_stock_selection"):
-            screened = await self._run_json_stage(
-                label="stock-screening",
-                stage="stock-screening",
-                task=self._build_stock_screening_task(strategy_name, trade_date),
-            )
-            if self.screening_only:
-                return self._build_screening_only_report(
+            with self._langfuse_attributes(
+                session_id=session_id,
+                metadata={
+                    "strategy_name": strategy_name,
+                    "trade_date": trade_date.isoformat(),
+                    "market": self.market,
+                },
+            ):
+                screened = await self._run_json_stage(
+                    label="stock-screening",
+                    stage="stock-screening",
+                    task=self._build_stock_screening_task(strategy_name, trade_date),
+                )
+                if self.screening_only:
+                    return self._build_screening_only_report(
+                        strategy_name=strategy_name,
+                        trade_date=trade_date,
+                        screened=screened["items"],
+                    )
+                # Temporarily disable the news-filter stage and pass stock-screening
+                # results directly into market-scoring.
+                # review_items, auto_allowed_items, prescreen_failures = self._prepare_news_filter_inputs(
+                #     [str(item["symbol"]) for item in screened["items"]],
+                #     trade_date=trade_date,
+                # )
+                # reviewed_items: list[dict[str, Any]] = []
+                # reviewed_failures: list[str] = []
+                # if review_items:
+                #     reviewed_items, reviewed_failures = await self._review_news_candidates(review_items)
+                # news_items = [*auto_allowed_items, *reviewed_items]
+                # partial_failures = [
+                #     *[str(item) for item in prescreen_failures],
+                #     *[str(item) for item in reviewed_failures],
+                # ]
+                # if self.news_filter_only:
+                #     return self._build_news_filter_only_report(
+                #         strategy_name=strategy_name,
+                #         trade_date=trade_date,
+                #         screened=screened["items"],
+                #         news_items=news_items,
+                #         partial_failures=partial_failures,
+                #     )
+                with self._langfuse_span("prepare-market-scoring-inputs"):
+                    scoring_items, _ = await self._prepare_market_scoring_inputs(
+                        [str(item["symbol"]) for item in screened["items"] if item.get("symbol")],
+                        trade_date=trade_date,
+                    )
+                with self._langfuse_span("market-scoring"):
+                    scored_items, _ = await self._score_market_items_individually(scoring_items)
+
+                with self._langfuse_span("merge-stage-outputs"):
+                    selected_stocks = self._merge_stage_outputs(
+                        strategy_name=strategy_name,
+                        trade_date=trade_date,
+                        screened=screened["items"],
+                        news_items=[],
+                        scoring_items=scored_items,
+                    )
+
+                # Temporarily disable the report-summary stage and return directly
+                # after market-scoring completes.
+                # summary_payload = await self._run_json_stage(
+                #     label="report-summary",
+                #     stage="report-summary",
+                #     task=self._build_report_summary_task(
+                #         [stock.symbol for stock in selected_stocks],
+                #     ),
+                # )
+
+                return DailySelectionReport(
+                    trade_date=trade_date,
                     strategy_name=strategy_name,
-                    trade_date=trade_date,
-                    screened=screened["items"],
+                    market=self.market,
+                    selected_stocks=selected_stocks,
+                    summary=(
+                        f"市场评分已完成，共选出 {len(selected_stocks)} 只股票。"
+                    ),
+                    global_risk_disclaimer=(
+                        "仅供研究参考，不构成任何投资建议。"
+                    ),
+                    partial_failures=[],
                 )
-            # Temporarily disable the news-filter stage and pass stock-screening
-            # results directly into market-scoring.
-            # review_items, auto_allowed_items, prescreen_failures = self._prepare_news_filter_inputs(
-            #     [str(item["symbol"]) for item in screened["items"]],
-            #     trade_date=trade_date,
-            # )
-            # reviewed_items: list[dict[str, Any]] = []
-            # reviewed_failures: list[str] = []
-            # if review_items:
-            #     reviewed_items, reviewed_failures = await self._review_news_candidates(review_items)
-            # news_items = [*auto_allowed_items, *reviewed_items]
-            # partial_failures = [
-            #     *[str(item) for item in prescreen_failures],
-            #     *[str(item) for item in reviewed_failures],
-            # ]
-            # if self.news_filter_only:
-            #     return self._build_news_filter_only_report(
-            #         strategy_name=strategy_name,
-            #         trade_date=trade_date,
-            #         screened=screened["items"],
-            #         news_items=news_items,
-            #         partial_failures=partial_failures,
-            #     )
-            with self._langfuse_span("prepare-market-scoring-inputs"):
-                scoring_items, _ = await self._prepare_market_scoring_inputs(
-                    [str(item["symbol"]) for item in screened["items"] if item.get("symbol")],
-                    trade_date=trade_date,
-                )
-            with self._langfuse_span("market-scoring"):
-                scored_items, _ = await self._score_market_items_individually(scoring_items)
-
-            with self._langfuse_span("merge-stage-outputs"):
-                selected_stocks = self._merge_stage_outputs(
-                    strategy_name=strategy_name,
-                    trade_date=trade_date,
-                    screened=screened["items"],
-                    news_items=[],
-                    scoring_items=scored_items,
-                )
-
-            # Temporarily disable the report-summary stage and return directly
-            # after market-scoring completes.
-            # summary_payload = await self._run_json_stage(
-            #     label="report-summary",
-            #     stage="report-summary",
-            #     task=self._build_report_summary_task(
-            #         [stock.symbol for stock in selected_stocks],
-            #     ),
-            # )
-
-            return DailySelectionReport(
-                trade_date=trade_date,
-                strategy_name=strategy_name,
-                market=self.market,
-                selected_stocks=selected_stocks,
-                summary=(
-                    f"市场评分已完成，共选出 {len(selected_stocks)} 只股票。"
-                ),
-                global_risk_disclaimer=(
-                    "仅供研究参考，不构成任何投资建议。"
-                ),
-                partial_failures=[],
-            )
 
     async def _run_json_stage(
         self,
@@ -187,24 +190,20 @@ class StockSelectionSubagentOrchestrator:
     def _build_langfuse_session_id(strategy_name: str, trade_date: date, market: str) -> str:
         return f"stock-selection:{market}:{strategy_name}:{trade_date.isoformat()}"
 
-    def _update_langfuse_root_trace(self, *, session_id: str, input_payload: dict[str, Any]) -> None:
-        if langfuse_context is None:
-            return
-        try:
-            langfuse_context.update_current_trace(
-                name="run_daily_stock_selection",
-                session_id=session_id,
-                input=input_payload,
-            )
-        except Exception:
-            return
-
-    @staticmethod
     def _langfuse_span(name: str):
         if langfuse_context is None:
             return contextlib.nullcontext()
         try:
             return langfuse_context.start_as_current_span(name=name)
+        except Exception:
+            return contextlib.nullcontext()
+
+    @staticmethod
+    def _langfuse_attributes(*, session_id: str, metadata: dict[str, Any]):
+        if propagate_attributes is None:
+            return contextlib.nullcontext()
+        try:
+            return propagate_attributes(session_id=session_id, metadata=metadata)
         except Exception:
             return contextlib.nullcontext()
 

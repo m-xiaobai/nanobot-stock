@@ -91,16 +91,34 @@ class _FakeLangfuseSpan:
         self._sink.append(("exit", self.name))
 
 
+class _FakeLangfuseAttributes:
+    def __init__(self, *, session_id: str, metadata: dict[str, Any], sink: list[tuple[str, Any]]) -> None:
+        self.session_id = session_id
+        self.metadata = metadata
+        self._sink = sink
+
+    def __enter__(self) -> "_FakeLangfuseAttributes":
+        self._sink.append(("enter_attributes", {"session_id": self.session_id, "metadata": self.metadata}))
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._sink.append(("exit_attributes", self.session_id))
+
+
 class _FakeLangfuseContext:
     def __init__(self) -> None:
-        self.events: list[tuple[str, Any]] = []
-
-    def update_current_trace(self, **kwargs: Any) -> None:
-        self.events.append(("update_current_trace", kwargs))
+        self.events = _FAKE_LANGFUSE_EVENTS
 
     def start_as_current_span(self, *, name: str):
         self.events.append(("start_span", name))
         return _FakeLangfuseSpan(name, self.events)
+
+
+def _fake_propagate_attributes(*, session_id: str, metadata: dict[str, Any]):
+    return _FakeLangfuseAttributes(session_id=session_id, metadata=metadata, sink=_FAKE_LANGFUSE_EVENTS)
+
+
+_FAKE_LANGFUSE_EVENTS: list[tuple[str, Any]] = []
 
 
 @pytest.mark.asyncio
@@ -266,6 +284,8 @@ def test_orchestrator_stage_prompts_define_roles_contracts_and_fail_safes() -> N
     assert "strategy=B1" in screening_prompt
     assert "strategy_skill_path=" not in screening_prompt
     assert '"screened_count": 5300' in screening_prompt
+    assert '"screen_pass_reasons"' not in screening_prompt
+    assert '"risk_notes"' not in screening_prompt
 
     assert "Task: Assess recent material negative news risk" in news_prompt
     assert "lookback_days=3" in news_prompt
@@ -388,6 +408,7 @@ async def test_orchestrator_scores_each_allowed_symbol_in_a_separate_market_scor
 
 @pytest.mark.asyncio
 async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FAKE_LANGFUSE_EVENTS.clear()
     executor = _FakeExecutor(
         responses=[
             """
@@ -407,6 +428,7 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
     )
     fake_context = _FakeLangfuseContext()
     monkeypatch.setattr("nanobot.stocks.orchestrator.langfuse_context", fake_context)
+    monkeypatch.setattr("nanobot.stocks.orchestrator.propagate_attributes", _fake_propagate_attributes)
 
     orchestrator = StockSelectionSubagentOrchestrator(
         executor=executor,
@@ -418,11 +440,14 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
 
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
-    update_events = [payload for kind, payload in fake_context.events if kind == "update_current_trace"]
-    assert len(update_events) == 1
-    assert update_events[0]["name"] == "run_daily_stock_selection"
-    assert update_events[0]["session_id"] == "stock-selection:A:B1:2026-05-26"
-    assert update_events[0]["input"] == {"strategy_name": "B1", "trade_date": "2026-05-26", "market": "A"}
+    attribute_events = [payload for kind, payload in fake_context.events if kind == "enter_attributes"]
+    assert len(attribute_events) == 1
+    assert attribute_events[0]["session_id"] == "stock-selection:A:B1:2026-05-26"
+    assert attribute_events[0]["metadata"] == {
+        "strategy_name": "B1",
+        "trade_date": "2026-05-26",
+        "market": "A",
+    }
 
     started_spans = [payload for kind, payload in fake_context.events if kind == "start_span"]
     assert started_spans == [
@@ -438,6 +463,7 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
 
 @pytest.mark.asyncio
 async def test_orchestrator_ignores_langfuse_when_context_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FAKE_LANGFUSE_EVENTS.clear()
     executor = _FakeExecutor(
         responses=[
             """
@@ -456,6 +482,7 @@ async def test_orchestrator_ignores_langfuse_when_context_is_unavailable(monkeyp
         ]
     )
     monkeypatch.setattr("nanobot.stocks.orchestrator.langfuse_context", None)
+    monkeypatch.setattr("nanobot.stocks.orchestrator.propagate_attributes", None)
 
     orchestrator = StockSelectionSubagentOrchestrator(
         executor=executor,
@@ -471,6 +498,7 @@ async def test_orchestrator_ignores_langfuse_when_context_is_unavailable(monkeyp
         "stock-screening",
         "market-scoring",
     ]
+    assert _FAKE_LANGFUSE_EVENTS == []
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
 
 
