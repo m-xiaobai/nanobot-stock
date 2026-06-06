@@ -105,11 +105,12 @@ class _FakeLangfuseAttributes:
         self._sink.append(("exit_attributes", self.session_id))
 
 
-class _FakeLangfuseContext:
+class _FakeLangfuseClient:
     def __init__(self) -> None:
         self.events = _FAKE_LANGFUSE_EVENTS
 
-    def start_as_current_span(self, *, name: str):
+    def start_as_current_observation(self, *, name: str, as_type: str):
+        self.events.append(("start_observation", {"name": name, "as_type": as_type}))
         self.events.append(("start_span", name))
         return _FakeLangfuseSpan(name, self.events)
 
@@ -429,8 +430,8 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
             """,
         ]
     )
-    fake_context = _FakeLangfuseContext()
-    monkeypatch.setattr("nanobot.stocks.orchestrator.langfuse_context", fake_context)
+    fake_client = _FakeLangfuseClient()
+    monkeypatch.setattr("nanobot.stocks.orchestrator.get_client", lambda: fake_client)
     monkeypatch.setattr("nanobot.stocks.orchestrator.propagate_attributes", _fake_propagate_attributes)
 
     orchestrator = StockSelectionSubagentOrchestrator(
@@ -443,7 +444,7 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
 
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
-    attribute_events = [payload for kind, payload in fake_context.events if kind == "enter_attributes"]
+    attribute_events = [payload for kind, payload in fake_client.events if kind == "enter_attributes"]
     assert len(attribute_events) == 1
     assert attribute_events[0]["session_id"] == "stock-selection:A:B1:2026-05-26"
     assert attribute_events[0]["metadata"] == {
@@ -452,7 +453,10 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
         "market": "A",
     }
 
-    started_spans = [payload for kind, payload in fake_context.events if kind == "start_span"]
+    started_observations = [payload for kind, payload in fake_client.events if kind == "start_observation"]
+    assert all(item["as_type"] == "span" for item in started_observations)
+
+    started_spans = [payload for kind, payload in fake_client.events if kind == "start_span"]
     assert started_spans == [
         "run_daily_stock_selection",
         "stock-screening",
@@ -484,7 +488,7 @@ async def test_orchestrator_ignores_langfuse_when_context_is_unavailable(monkeyp
             """,
         ]
     )
-    monkeypatch.setattr("nanobot.stocks.orchestrator.langfuse_context", None)
+    monkeypatch.setattr("nanobot.stocks.orchestrator.get_client", None)
     monkeypatch.setattr("nanobot.stocks.orchestrator.propagate_attributes", None)
 
     orchestrator = StockSelectionSubagentOrchestrator(

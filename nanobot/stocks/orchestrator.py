@@ -24,10 +24,9 @@ from nanobot.stocks.service import (
 from nanobot.utils.prompt_templates import render_template
 
 try:
-    from langfuse.decorators import langfuse_context
-    from langfuse.utils import propagate_attributes
+    from langfuse import get_client, propagate_attributes
 except Exception:  # pragma: no cover - optional dependency
-    langfuse_context = None
+    get_client = None
     propagate_attributes = None
 
 
@@ -192,10 +191,10 @@ class StockSelectionSubagentOrchestrator:
 
     @staticmethod
     def _langfuse_span(name: str):
-        if langfuse_context is None:
+        if get_client is None:
             return contextlib.nullcontext()
         try:
-            return langfuse_context.start_as_current_span(name=name)
+            return get_client().start_as_current_observation(name=name, as_type="span")
         except Exception:
             return contextlib.nullcontext()
 
