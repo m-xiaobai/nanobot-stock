@@ -190,6 +190,7 @@ class StockSelectionSubagentOrchestrator:
     def _build_langfuse_session_id(strategy_name: str, trade_date: date, market: str) -> str:
         return f"stock-selection:{market}:{strategy_name}:{trade_date.isoformat()}"
 
+    @staticmethod
     def _langfuse_span(name: str):
         if langfuse_context is None:
             return contextlib.nullcontext()
@@ -247,11 +248,11 @@ class StockSelectionSubagentOrchestrator:
             SelectedStockReport(
                 symbol=str(item["symbol"]),
                 strategy_name=str(item.get("strategy_name") or strategy_name),
-                screen_pass_reasons=[str(reason) for reason in item.get("screen_pass_reasons", [])],
+                screen_pass_reasons=[],
                 negative_news_flags=[],
                 technical_score=0,
                 score_reasons=[],
-                risk_notes=[str(note) for note in item.get("risk_notes", [])],
+                risk_notes=[],
                 report_date=trade_date,
             )
             for item in screened
@@ -290,12 +291,11 @@ class StockSelectionSubagentOrchestrator:
                 SelectedStockReport(
                     symbol=symbol,
                     strategy_name=str(item.get("strategy_name") or strategy_name),
-                    screen_pass_reasons=[str(reason) for reason in item.get("screen_pass_reasons", [])],
+                    screen_pass_reasons=[],
                     negative_news_flags=[str(flag) for flag in news_raw.get("negative_news_flags", [])],
                     technical_score=0,
                     score_reasons=[],
                     risk_notes=[
-                        *[str(note) for note in item.get("risk_notes", [])],
                         *[str(note) for note in news_raw.get("risk_notes", [])],
                     ],
                     report_date=trade_date,

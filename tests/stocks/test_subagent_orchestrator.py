@@ -211,8 +211,9 @@ async def test_orchestrator_defaults_to_screening_only_mode() -> None:
 
     assert [label for label, _task, _system in executor.calls] == ["stock-screening"]
     assert [item.symbol for item in report.selected_stocks] == ["600001", "600002"]
+    assert all(item.screen_pass_reasons == [] for item in report.selected_stocks)
+    assert all(item.risk_notes == [] for item in report.selected_stocks)
     assert report.selected_stocks[0].technical_score == 0
-    assert report.selected_stocks[1].risk_notes == ["needs manual review"]
     assert report.summary == "Screening-only mode: 2 candidate(s) passed stock-screening."
     assert report.global_risk_disclaimer == "For research use only. This screening-only report is not investment advice."
     assert report.partial_failures == ["screening_only mode enabled; skipped news-filter, market-scoring, report-summary"]
@@ -252,8 +253,10 @@ async def test_orchestrator_can_stop_after_news_filter_stage() -> None:
         "news-filter",
     ]
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
+    assert report.selected_stocks[0].screen_pass_reasons == []
     assert report.selected_stocks[0].technical_score == 0
     assert report.selected_stocks[0].negative_news_flags == []
+    assert report.selected_stocks[0].risk_notes == []
     assert report.summary == "News-filter-only mode: 1 candidate(s) passed stock-screening and news-filter."
     assert report.global_risk_disclaimer == "For research use only. This news-filter-only report is not investment advice."
     assert report.partial_failures == ["news_filter_only mode enabled; skipped market-scoring, report-summary"]
