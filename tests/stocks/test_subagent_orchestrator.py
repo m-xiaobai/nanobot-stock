@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import date
 from typing import Any
 
@@ -75,6 +76,31 @@ class _FakeTechnicalAdapter:
             if result is not None:
                 snapshots[symbol] = dict(result)
         return snapshots
+
+
+class _FakeLangfuseSpan:
+    def __init__(self, name: str, sink: list[tuple[str, str]]) -> None:
+        self.name = name
+        self._sink = sink
+
+    def __enter__(self) -> "_FakeLangfuseSpan":
+        self._sink.append(("enter", self.name))
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._sink.append(("exit", self.name))
+
+
+class _FakeLangfuseContext:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, Any]] = []
+
+    def update_current_trace(self, **kwargs: Any) -> None:
+        self.events.append(("update_current_trace", kwargs))
+
+    def start_as_current_span(self, *, name: str):
+        self.events.append(("start_span", name))
+        return _FakeLangfuseSpan(name, self.events)
 
 
 @pytest.mark.asyncio
@@ -358,6 +384,94 @@ async def test_orchestrator_scores_each_allowed_symbol_in_a_separate_market_scor
     assert '"symbol": "000001"' in market_scoring_calls[1]
     assert '"symbol": "600001"' not in market_scoring_calls[1]
     assert [item.symbol for item in report.selected_stocks] == ["600001", "000001"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch: pytest.MonkeyPatch) -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","strategy_name":"B1",
+               "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","technical_score":91,
+               "score_reasons":["trend is above the short and medium moving averages"],
+               "risk_notes":["watch for next-day follow-through"]}
+            ]}
+            """,
+        ]
+    )
+    fake_context = _FakeLangfuseContext()
+    monkeypatch.setattr("nanobot.stocks.orchestrator.langfuse_context", fake_context)
+
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        technical_data=_FakeTechnicalAdapter(
+            {"600001": {"symbol": "600001", "close": 12.36, "data_status": "ok"}}
+        ),
+    )
+
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
+
+    update_events = [payload for kind, payload in fake_context.events if kind == "update_current_trace"]
+    assert len(update_events) == 1
+    assert update_events[0]["name"] == "run_daily_stock_selection"
+    assert update_events[0]["session_id"] == "stock-selection:A:B1:2026-05-26"
+    assert update_events[0]["input"] == {"strategy_name": "B1", "trade_date": "2026-05-26", "market": "A"}
+
+    started_spans = [payload for kind, payload in fake_context.events if kind == "start_span"]
+    assert started_spans == [
+        "run_daily_stock_selection",
+        "stock-screening",
+        "prepare-market-scoring-inputs",
+        "market-scoring",
+        "market-scoring:600001",
+        "merge-stage-outputs",
+    ]
+    assert [item.symbol for item in report.selected_stocks] == ["600001"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_ignores_langfuse_when_context_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","strategy_name":"B1",
+               "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","technical_score":91,
+               "score_reasons":["trend is above the short and medium moving averages"],
+               "risk_notes":["watch for next-day follow-through"]}
+            ]}
+            """,
+        ]
+    )
+    monkeypatch.setattr("nanobot.stocks.orchestrator.langfuse_context", None)
+
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        technical_data=_FakeTechnicalAdapter(
+            {"600001": {"symbol": "600001", "close": 12.36, "data_status": "ok"}}
+        ),
+    )
+
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
+
+    assert [label for label, _task, _system, _builtin, _mcp, _light in executor.calls] == [
+        "stock-screening",
+        "market-scoring",
+    ]
+    assert [item.symbol for item in report.selected_stocks] == ["600001"]
 
 
 @pytest.mark.asyncio
