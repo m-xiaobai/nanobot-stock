@@ -177,7 +177,9 @@ class StockSelectionSubagentOrchestrator:
                     label=label,
                     temperature=0.0,
                     extra_system_prompt=self._build_stage_system_prompt(stage),
+                    allow_builtin_tools=stage != "market-scoring",
                     allow_mcp_tools=stage != "market-scoring",
+                    use_lightweight_system_prompt=stage == "market-scoring",
                 )
         parsed = self._extract_json(raw, stage)
         if not isinstance(parsed, dict):
