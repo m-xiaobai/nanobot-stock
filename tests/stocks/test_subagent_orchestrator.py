@@ -92,7 +92,7 @@ class _FakeLangfuseSpan:
 
 
 class _FakeLangfuseAttributes:
-    def __init__(self, *, session_id: str, metadata: dict[str, Any], sink: list[tuple[str, Any]]) -> None:
+    def __init__(self, *, session_id: str | None, metadata: dict[str, Any], sink: list[tuple[str, Any]]) -> None:
         self.session_id = session_id
         self.metadata = metadata
         self._sink = sink
@@ -115,7 +115,7 @@ class _FakeLangfuseClient:
         return _FakeLangfuseSpan(name, self.events)
 
 
-def _fake_propagate_attributes(*, session_id: str, metadata: dict[str, Any]):
+def _fake_propagate_attributes(*, metadata: dict[str, Any], session_id: str | None = None):
     return _FakeLangfuseAttributes(session_id=session_id, metadata=metadata, sink=_FAKE_LANGFUSE_EVENTS)
 
 
@@ -445,12 +445,20 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     attribute_events = [payload for kind, payload in fake_client.events if kind == "enter_attributes"]
-    assert len(attribute_events) == 1
+    assert len(attribute_events) == 3
     assert attribute_events[0]["session_id"].startswith("stock-selection:A:B1:2026-05-26:run-")
     assert attribute_events[0]["metadata"] == {
         "strategy_name": "B1",
         "trade_date": "2026-05-26",
         "market": "A",
+    }
+    assert attribute_events[1] == {
+        "session_id": None,
+        "metadata": {"stage": "stock-screening"},
+    }
+    assert attribute_events[2] == {
+        "session_id": None,
+        "metadata": {"stage": "market-scoring"},
     }
 
     started_observations = [payload for kind, payload in fake_client.events if kind == "start_observation"]

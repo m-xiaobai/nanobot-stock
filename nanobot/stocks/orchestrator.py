@@ -125,8 +125,8 @@ class StockSelectionSubagentOrchestrator:
                         [str(item["symbol"]) for item in screened["items"] if item.get("symbol")],
                         trade_date=trade_date,
                     )
-                with self._langfuse_span("market-scoring"):
-                    scored_items, _ = await self._score_market_items_individually(scoring_items)
+                
+                scored_items, _ = await self._score_market_items_individually(scoring_items)
 
                 with self._langfuse_span("merge-stage-outputs"):
                     selected_stocks = self._merge_stage_outputs(
@@ -171,13 +171,14 @@ class StockSelectionSubagentOrchestrator:
     ) -> dict[str, Any]:
         span_context = self._langfuse_span(stage) if trace_stage else contextlib.nullcontext()
         with span_context:
-            raw = await self.executor.run_inline(
-                task=task,
-                label=label,
-                temperature=0.0,
-                extra_system_prompt=self._build_stage_system_prompt(stage),
-                allow_mcp_tools=stage != "market-scoring",
-            )
+            with self._langfuse_metadata({"stage": stage}):
+                raw = await self.executor.run_inline(
+                    task=task,
+                    label=label,
+                    temperature=0.0,
+                    extra_system_prompt=self._build_stage_system_prompt(stage),
+                    allow_mcp_tools=stage != "market-scoring",
+                )
         parsed = self._extract_json(raw, stage)
         if not isinstance(parsed, dict):
             raise DailySelectionServiceError(f"{stage} returned non-object JSON")
@@ -206,6 +207,15 @@ class StockSelectionSubagentOrchestrator:
             return contextlib.nullcontext()
         try:
             return propagate_attributes(session_id=session_id, metadata=metadata)
+        except Exception:
+            return contextlib.nullcontext()
+
+    @staticmethod
+    def _langfuse_metadata(metadata: dict[str, Any]):
+        if propagate_attributes is None:
+            return contextlib.nullcontext()
+        try:
+            return propagate_attributes(metadata=metadata)
         except Exception:
             return contextlib.nullcontext()
 
@@ -371,28 +381,29 @@ class StockSelectionSubagentOrchestrator:
     ) -> tuple[list[dict[str, Any]], list[str]]:
         scored_items: list[dict[str, Any]] = []
         partial_failures: list[str] = []
-
-        for item in scoring_items:
-            symbol = str(item.get("symbol", ""))
-            try:
-                scoring = await self._run_json_stage(
-                    label="market-scoring",
-                    stage="market-scoring",
-                    task=self._build_market_scoring_task([item]),
-                    trace_stage=False,
-                )
-                raw_items = scoring.get("items")
-                if not isinstance(raw_items, list) or len(raw_items) != 1:
-                    raise ValueError("expected exactly one scored item")
-                scored_item = raw_items[0]
-                if not isinstance(scored_item, dict):
-                    raise TypeError("scored item must be a JSON object")
-                scored_symbol = str(scored_item.get("symbol", ""))
-                if scored_symbol != symbol:
-                    raise ValueError(f"expected symbol {symbol}, got {scored_symbol or 'missing'}")
-                scored_items.append(scored_item)
-            except Exception as exc:
-                partial_failures.append(f"market scoring unavailable for {symbol}: {exc}")
+        span_context = self._langfuse_span("market-scoring")
+        with span_context:
+            for item in scoring_items:
+                symbol = str(item.get("symbol", ""))
+                try:
+                    scoring = await self._run_json_stage(
+                        label="market-scoring",
+                        stage="market-scoring",
+                        task=self._build_market_scoring_task([item]),
+                        trace_stage=False,
+                    )
+                    raw_items = scoring.get("items")
+                    if not isinstance(raw_items, list) or len(raw_items) != 1:
+                        raise ValueError("expected exactly one scored item")
+                    scored_item = raw_items[0]
+                    if not isinstance(scored_item, dict):
+                        raise TypeError("scored item must be a JSON object")
+                    scored_symbol = str(scored_item.get("symbol", ""))
+                    if scored_symbol != symbol:
+                        raise ValueError(f"expected symbol {symbol}, got {scored_symbol or 'missing'}")
+                    scored_items.append(scored_item)
+                except Exception as exc:
+                    partial_failures.append(f"market scoring unavailable for {symbol}: {exc}")
 
         return scored_items, partial_failures
 
