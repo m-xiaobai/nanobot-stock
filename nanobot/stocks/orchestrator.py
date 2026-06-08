@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -176,9 +176,7 @@ class StockSelectionSubagentOrchestrator:
                 label=label,
                 temperature=0.0,
                 extra_system_prompt=self._build_stage_system_prompt(stage),
-                allow_builtin_tools=stage != "market-scoring",
                 allow_mcp_tools=stage != "market-scoring",
-                use_lightweight_system_prompt=stage == "market-scoring",
             )
         parsed = self._extract_json(raw, stage)
         if not isinstance(parsed, dict):
@@ -187,7 +185,11 @@ class StockSelectionSubagentOrchestrator:
 
     @staticmethod
     def _build_langfuse_session_id(strategy_name: str, trade_date: date, market: str) -> str:
-        return f"stock-selection:{market}:{strategy_name}:{trade_date.isoformat()}"
+        run_ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        return (
+            f"stock-selection:{market}:{strategy_name}:"
+            f"{trade_date.isoformat()}:run-{run_ts}"
+        )
 
     @staticmethod
     def _langfuse_span(name: str):
@@ -373,13 +375,12 @@ class StockSelectionSubagentOrchestrator:
         for item in scoring_items:
             symbol = str(item.get("symbol", ""))
             try:
-                with self._langfuse_span(f"market-scoring:{symbol or 'unknown'}"):
-                    scoring = await self._run_json_stage(
-                        label="market-scoring",
-                        stage="market-scoring",
-                        task=self._build_market_scoring_task([item]),
-                        trace_stage=False,
-                    )
+                scoring = await self._run_json_stage(
+                    label="market-scoring",
+                    stage="market-scoring",
+                    task=self._build_market_scoring_task([item]),
+                    trace_stage=False,
+                )
                 raw_items = scoring.get("items")
                 if not isinstance(raw_items, list) or len(raw_items) != 1:
                     raise ValueError("expected exactly one scored item")

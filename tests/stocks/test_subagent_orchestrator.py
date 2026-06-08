@@ -446,7 +446,7 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
 
     attribute_events = [payload for kind, payload in fake_client.events if kind == "enter_attributes"]
     assert len(attribute_events) == 1
-    assert attribute_events[0]["session_id"] == "stock-selection:A:B1:2026-05-26"
+    assert attribute_events[0]["session_id"].startswith("stock-selection:A:B1:2026-05-26:run-")
     assert attribute_events[0]["metadata"] == {
         "strategy_name": "B1",
         "trade_date": "2026-05-26",
