@@ -71,6 +71,7 @@ class StockSelectionSubagentOrchestrator:
     screening_only: bool = False
     news_filter_only: bool = True
     lookback_days: int = 3
+    market_scoring_batch_size: int = 5
 
     async def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
         if strategy_name not in _SUPPORTED_STRATEGIES:
@@ -126,7 +127,7 @@ class StockSelectionSubagentOrchestrator:
                         trade_date=trade_date,
                     )
                 
-                scored_items, _ = await self._score_market_items_individually(scoring_items)
+                scored_items, partial_failures = await self._score_market_items_individually(scoring_items)
 
                 with self._langfuse_span("merge-stage-outputs"):
                     selected_stocks = self._merge_stage_outputs(
@@ -158,7 +159,7 @@ class StockSelectionSubagentOrchestrator:
                     global_risk_disclaimer=(
                         "仅供研究参考，不构成任何投资建议。"
                     ),
-                    partial_failures=[],
+                    partial_failures=partial_failures,
                 )
 
     async def _run_json_stage(
@@ -385,28 +386,86 @@ class StockSelectionSubagentOrchestrator:
         partial_failures: list[str] = []
         span_context = self._langfuse_span("market-scoring")
         with span_context:
-            for item in scoring_items:
-                symbol = str(item.get("symbol", ""))
-                try:
-                    scoring = await self._run_json_stage(
-                        label="market-scoring",
-                        stage="market-scoring",
-                        task=self._build_market_scoring_task([item]),
-                        trace_stage=False,
-                    )
-                    raw_items = scoring.get("items")
-                    if not isinstance(raw_items, list) or len(raw_items) != 1:
-                        raise ValueError("expected exactly one scored item")
-                    scored_item = raw_items[0]
-                    if not isinstance(scored_item, dict):
-                        raise TypeError("scored item must be a JSON object")
-                    scored_symbol = str(scored_item.get("symbol", ""))
-                    if scored_symbol != symbol:
-                        raise ValueError(f"expected symbol {symbol}, got {scored_symbol or 'missing'}")
-                    scored_items.append(scored_item)
-                except Exception as exc:
-                    partial_failures.append(f"market scoring unavailable for {symbol}: {exc}")
+            batch_size = max(1, self.market_scoring_batch_size)
+            for batch in self._chunk_scoring_items(scoring_items, batch_size):
+                if len(batch) == 1:
+                    batch_scored, batch_failures = await self._score_market_items_one_by_one(batch)
+                else:
+                    try:
+                        batch_scored = await self._score_market_items_batch(batch)
+                        batch_failures = []
+                    except Exception:
+                        batch_scored, batch_failures = await self._score_market_items_one_by_one(batch)
+                scored_items.extend(batch_scored)
+                partial_failures.extend(batch_failures)
 
+        return scored_items, partial_failures
+
+    @staticmethod
+    def _chunk_scoring_items(
+        scoring_items: list[dict[str, Any]],
+        batch_size: int,
+    ) -> list[list[dict[str, Any]]]:
+        return [
+            scoring_items[index:index + batch_size]
+            for index in range(0, len(scoring_items), batch_size)
+        ]
+
+    async def _score_market_items_batch(
+        self,
+        batch: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        scoring = await self._run_json_stage(
+            label="market-scoring",
+            stage="market-scoring",
+            task=self._build_market_scoring_task(batch),
+            trace_stage=False,
+        )
+        raw_items = scoring.get("items")
+        if not isinstance(raw_items, list) or len(raw_items) != len(batch):
+            raise ValueError(f"expected exactly {len(batch)} scored items")
+
+        expected_symbols = {str(item.get("symbol", "")) for item in batch}
+        actual_symbols: set[str] = set()
+        scored_items: list[dict[str, Any]] = []
+        for scored_item in raw_items:
+            if not isinstance(scored_item, dict):
+                raise TypeError("scored item must be a JSON object")
+            actual_symbols.add(str(scored_item.get("symbol", "")))
+            scored_items.append(scored_item)
+        if actual_symbols != expected_symbols:
+            raise ValueError(
+                f"expected symbols {sorted(expected_symbols)!r}, got {sorted(actual_symbols)!r}"
+            )
+        return scored_items
+
+    async def _score_market_items_one_by_one(
+        self,
+        scoring_items: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        scored_items: list[dict[str, Any]] = []
+        partial_failures: list[str] = []
+        for item in scoring_items:
+            symbol = str(item.get("symbol", ""))
+            try:
+                scoring = await self._run_json_stage(
+                    label="market-scoring",
+                    stage="market-scoring",
+                    task=self._build_market_scoring_task([item]),
+                    trace_stage=False,
+                )
+                raw_items = scoring.get("items")
+                if not isinstance(raw_items, list) or len(raw_items) != 1:
+                    raise ValueError("expected exactly one scored item")
+                scored_item = raw_items[0]
+                if not isinstance(scored_item, dict):
+                    raise TypeError("scored item must be a JSON object")
+                scored_symbol = str(scored_item.get("symbol", ""))
+                if scored_symbol != symbol:
+                    raise ValueError(f"expected symbol {symbol}, got {scored_symbol or 'missing'}")
+                scored_items.append(scored_item)
+            except Exception as exc:
+                partial_failures.append(f"market scoring unavailable for {symbol}: {exc}")
         return scored_items, partial_failures
 
     async def _review_news_candidates(

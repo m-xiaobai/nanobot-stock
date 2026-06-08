@@ -350,7 +350,7 @@ def test_merge_stage_outputs_uses_only_market_scoring_and_keeps_top_ten() -> Non
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_scores_each_allowed_symbol_in_a_separate_market_scoring_call() -> None:
+async def test_orchestrator_scores_allowed_symbols_in_a_single_market_scoring_batch_by_default() -> None:
     executor = _FakeExecutor(
         responses=[
             """
@@ -363,19 +363,9 @@ async def test_orchestrator_scores_each_allowed_symbol_in_a_separate_market_scor
             """,
             """
             {"items":[
-              {"symbol":"600001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]},
-              {"symbol":"000001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]}
-            ],"partial_failures":[]}
-            """,
-            """
-            {"items":[
               {"symbol":"600001","technical_score":91,
                "score_reasons":["trend is above the short and medium moving averages"],
-               "risk_notes":["watch for next-day follow-through"]}
-            ]}
-            """,
-            """
-            {"items":[
+               "risk_notes":["watch for next-day follow-through"]},
               {"symbol":"000001","technical_score":83,
                "score_reasons":["volume confirms the move"],
                "risk_notes":[]}
@@ -400,13 +390,11 @@ async def test_orchestrator_scores_each_allowed_symbol_in_a_separate_market_scor
 
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
-    market_scoring_calls = [task for label, task, _system in executor.calls if label == "market-scoring"]
+    market_scoring_calls = [task for label, task, *_rest in executor.calls if label == "market-scoring"]
 
-    assert len(market_scoring_calls) == 2
+    assert len(market_scoring_calls) == 1
     assert '"symbol": "600001"' in market_scoring_calls[0]
-    assert '"symbol": "000001"' not in market_scoring_calls[0]
-    assert '"symbol": "000001"' in market_scoring_calls[1]
-    assert '"symbol": "600001"' not in market_scoring_calls[1]
+    assert '"symbol": "000001"' in market_scoring_calls[0]
     assert [item.symbol for item in report.selected_stocks] == ["600001", "000001"]
 
 
@@ -470,7 +458,6 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
         "stock-screening",
         "prepare-market-scoring-inputs",
         "market-scoring",
-        "market-scoring:600001",
         "merge-stage-outputs",
     ]
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
@@ -530,10 +517,7 @@ async def test_orchestrator_skips_single_symbol_market_scoring_failures_and_reco
             ]}
             """,
             """
-            {"items":[
-              {"symbol":"600001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]},
-              {"symbol":"000001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]}
-            ],"partial_failures":[]}
+            {"items":[]}
             """,
             """
             {"items":[
@@ -544,10 +528,6 @@ async def test_orchestrator_skips_single_symbol_market_scoring_failures_and_reco
             """,
             """
             {"items":[]}
-            """,
-            """
-            {"summary":"Selected candidates: 600001.",
-             "global_risk_disclaimer":"For research use only."}
             """,
         ]
     )
@@ -564,8 +544,69 @@ async def test_orchestrator_skips_single_symbol_market_scoring_failures_and_reco
 
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
+    market_scoring_calls = [task for label, task, *_rest in executor.calls if label == "market-scoring"]
+
+    assert len(market_scoring_calls) == 3
+    assert '"symbol": "600001"' in market_scoring_calls[0]
+    assert '"symbol": "000001"' in market_scoring_calls[0]
+    assert '"symbol": "600001"' in market_scoring_calls[1]
+    assert '"symbol": "000001"' not in market_scoring_calls[1]
+    assert '"symbol": "000001"' in market_scoring_calls[2]
+    assert '"symbol": "600001"' not in market_scoring_calls[2]
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
     assert report.partial_failures == ["market scoring unavailable for 000001: expected exactly one scored item"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_market_scoring_batch_size_one_preserves_single_symbol_call_pattern() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","strategy_name":"B1",
+               "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]},
+              {"symbol":"000001","strategy_name":"B1",
+               "screen_pass_reasons":["volume expanded versus the recent average"],"risk_notes":[]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","technical_score":91,
+               "score_reasons":["trend is above the short and medium moving averages"],
+               "risk_notes":["watch for next-day follow-through"]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"000001","technical_score":83,
+               "score_reasons":["volume confirms the move"],
+               "risk_notes":[]}
+            ]}
+            """,
+        ]
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        technical_data=_FakeTechnicalAdapter(
+            {
+                "600001": {"symbol": "600001", "close": 12.36, "data_status": "ok"},
+                "000001": {"symbol": "000001", "close": 9.18, "data_status": "ok"},
+            }
+        ),
+        market_scoring_batch_size=1,
+    )
+
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
+
+    market_scoring_calls = [task for label, task, *_rest in executor.calls if label == "market-scoring"]
+
+    assert len(market_scoring_calls) == 2
+    assert '"symbol": "600001"' in market_scoring_calls[0]
+    assert '"symbol": "000001"' not in market_scoring_calls[0]
+    assert '"symbol": "000001"' in market_scoring_calls[1]
+    assert '"symbol": "600001"' not in market_scoring_calls[1]
+    assert [item.symbol for item in report.selected_stocks] == ["600001", "000001"]
 
 
 def test_orchestrator_stage_prompts_are_loaded_from_templates() -> None:
@@ -594,6 +635,8 @@ def test_orchestrator_task_prompts_keep_hard_rules_out_of_user_layer() -> None:
     assert "趋势结构" not in scoring_prompt
     assert "0-25" not in scoring_prompt
     assert "FILTER_OUT" not in scoring_prompt
+    assert "输入中的 `items` 可能包含 1 只或多只股票" in scoring_prompt
+    assert "输出中的 `items` 必须与输入股票一一对应" in scoring_prompt
 
 
 def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
@@ -615,6 +658,8 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
 
     assert "You are a specialized A-share technical scoring analyst." in scoring_system
     assert "technical_score must be an integer from 0 to 100" in scoring_system
+    assert "必须对 `items` 中的每只股票各返回一条结果" in scoring_system
+    assert "symbol 集合必须与输入完全一致" in scoring_system
     assert "Scoring rubric:" in scoring_system
     assert "trend structure: 0-25" in scoring_system
     assert "range position: 0-10" in scoring_system
@@ -624,10 +669,12 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
     assert "RSI: 0-10" in scoring_system
     assert "risk penalty: 0 to -15" in scoring_system
     assert "technical_score = trend + position + volume_price + momentum + macd + rsi + risk_penalty" in scoring_system
-    assert "Decision bands:" in scoring_system
-    assert "<40 => FILTER_OUT" in scoring_system
-    assert "40-54 => WEAK_PASS" in scoring_system
-    assert ">=55 => PASS" in scoring_system
+    assert "分数参考：" in scoring_system
+    assert "低于 40 分" in scoring_system
+    assert "40 到 54 分" in scoring_system
+    assert "55 分及以上" in scoring_system
+    assert "FILTER_OUT" not in scoring_system
+    assert "WEAK_PASS" not in scoring_system
     assert "Do not invent your own scoring rubric" in scoring_system
 
     assert "You are a specialized A-share report summarizer." in summary_system
