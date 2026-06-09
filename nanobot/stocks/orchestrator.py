@@ -140,6 +140,27 @@ class StockSelectionSubagentOrchestrator:
                         news_items=[],
                         scoring_items=scored_items,
                     )
+                    self._langfuse_observation_payload(
+                        input_payload={
+                            "strategy_name": strategy_name,
+                            "trade_date": trade_date.isoformat(),
+                            "screened_count": len(screened["items"]),
+                            "news_items_count": 0,
+                            "scoring_items": scored_items,
+                        },
+                        output_payload={
+                            "selected_count": len(selected_stocks),
+                            "selected_stocks": [
+                                {
+                                    "symbol": item.symbol,
+                                    "technical_score": item.technical_score,
+                                    "score_reasons": item.score_reasons,
+                                    "risk_notes": item.risk_notes,
+                                }
+                                for item in selected_stocks
+                            ],
+                        },
+                    )
 
                 # Temporarily disable the report-summary stage and return directly
                 # after market-scoring completes.
@@ -224,6 +245,40 @@ class StockSelectionSubagentOrchestrator:
             return propagate_attributes(metadata=metadata)
         except Exception:
             return contextlib.nullcontext()
+
+    @staticmethod
+    def _langfuse_observation_payload(
+        *,
+        input_payload: dict[str, Any] | None = None,
+        output_payload: dict[str, Any] | None = None,
+    ) -> None:
+        if get_client is None:
+            return
+        try:
+            client = get_client()
+        except Exception:
+            return
+        if client is None:
+            return
+
+        update = getattr(client, "update_current_observation", None)
+        if not callable(update):
+            update = getattr(client, "update_current_span", None)
+        if not callable(update):
+            return
+
+        payload: dict[str, Any] = {}
+        if input_payload is not None:
+            payload["input"] = input_payload
+        if output_payload is not None:
+            payload["output"] = output_payload
+        if not payload:
+            return
+
+        try:
+            update(**payload)
+        except Exception:
+            return
 
     @staticmethod
     def _extract_json(raw: str, stage: str) -> dict[str, Any]:

@@ -114,6 +114,9 @@ class _FakeLangfuseClient:
         self.events.append(("start_span", name))
         return _FakeLangfuseSpan(name, self.events)
 
+    def update_current_observation(self, **payload: Any) -> None:
+        self.events.append(("update_current_observation", payload))
+
 
 def _fake_propagate_attributes(*, metadata: dict[str, Any], session_id: str | None = None):
     return _FakeLangfuseAttributes(session_id=session_id, metadata=metadata, sink=_FAKE_LANGFUSE_EVENTS)
@@ -460,6 +463,38 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
         "prepare-market-scoring-inputs",
         "market-scoring",
         "merge-stage-outputs",
+    ]
+    observation_updates = [
+        payload for kind, payload in fake_client.events if kind == "update_current_observation"
+    ]
+    assert observation_updates == [
+        {
+            "input": {
+                "strategy_name": "B1",
+                "trade_date": "2026-05-26",
+                "screened_count": 1,
+                "news_items_count": 0,
+                "scoring_items": [
+                    {
+                        "symbol": "600001",
+                        "technical_score": 91,
+                        "score_reasons": ["trend is above the short and medium moving averages"],
+                        "risk_notes": ["watch for next-day follow-through"],
+                    }
+                ],
+            },
+            "output": {
+                "selected_count": 1,
+                "selected_stocks": [
+                    {
+                        "symbol": "600001",
+                        "technical_score": 91,
+                        "score_reasons": ["trend is above the short and medium moving averages"],
+                        "risk_notes": ["watch for next-day follow-through"],
+                    }
+                ],
+            },
+        }
     ]
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
 
