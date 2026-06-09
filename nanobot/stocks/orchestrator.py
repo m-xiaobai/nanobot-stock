@@ -71,7 +71,7 @@ class StockSelectionSubagentOrchestrator:
     screening_only: bool = False
     news_filter_only: bool = True
     lookback_days: int = 3
-    market_scoring_max_concurrency: int = 3
+    market_scoring_max_concurrency: int = 5
 
     async def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
         if strategy_name not in _SUPPORTED_STRATEGIES:
@@ -127,7 +127,10 @@ class StockSelectionSubagentOrchestrator:
                         trade_date=trade_date,
                     )
                 
-                scored_items, partial_failures = await self._score_market_items_individually(scoring_items)
+                with self._langfuse_span("market-scoring"):
+                    scored_items, partial_failures = await self._score_market_items_individually(
+                        scoring_items
+                    )
 
                 with self._langfuse_span("merge-stage-outputs"):
                     selected_stocks = self._merge_stage_outputs(
@@ -382,43 +385,41 @@ class StockSelectionSubagentOrchestrator:
         self,
         scoring_items: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        span_context = self._langfuse_span("market-scoring")
-        with span_context:
-            if not scoring_items:
-                return [], []
+        if not scoring_items:
+            return [], []
 
-            concurrency = max(1, self.market_scoring_max_concurrency)
-            gate = asyncio.Semaphore(concurrency)
+        concurrency = max(1, self.market_scoring_max_concurrency)
+        gate = asyncio.Semaphore(concurrency)
 
-            async def _score_one(item: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-                async with gate:
-                    symbol = str(item.get("symbol", ""))
-                    try:
-                        scoring = await self._run_json_stage(
-                            label="market-scoring",
-                            stage="market-scoring",
-                            task=self._build_market_scoring_task([item]),
-                            trace_stage=False,
+        async def _score_one(item: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+            async with gate:
+                symbol = str(item.get("symbol", ""))
+                try:
+                    scoring = await self._run_json_stage(
+                        label="market-scoring",
+                        stage="market-scoring",
+                        task=self._build_market_scoring_task([item]),
+                        trace_stage=False,
+                    )
+                    raw_items = scoring.get("items")
+                    if not isinstance(raw_items, list) or len(raw_items) != 1:
+                        raise ValueError("expected exactly one scored item")
+                    scored_item = raw_items[0]
+                    if not isinstance(scored_item, dict):
+                        raise TypeError("scored item must be a JSON object")
+                    scored_symbol = str(scored_item.get("symbol", ""))
+                    if scored_symbol != symbol:
+                        raise ValueError(
+                            f"expected symbol {symbol}, got {scored_symbol or 'missing'}"
                         )
-                        raw_items = scoring.get("items")
-                        if not isinstance(raw_items, list) or len(raw_items) != 1:
-                            raise ValueError("expected exactly one scored item")
-                        scored_item = raw_items[0]
-                        if not isinstance(scored_item, dict):
-                            raise TypeError("scored item must be a JSON object")
-                        scored_symbol = str(scored_item.get("symbol", ""))
-                        if scored_symbol != symbol:
-                            raise ValueError(
-                                f"expected symbol {symbol}, got {scored_symbol or 'missing'}"
-                            )
-                        return scored_item, None
-                    except Exception as exc:
-                        return None, f"market scoring unavailable for {symbol}: {exc}"
+                    return scored_item, None
+                except Exception as exc:
+                    return None, f"market scoring unavailable for {symbol}: {exc}"
 
-            results = await asyncio.gather(*(_score_one(item) for item in scoring_items))
-            scored_items = [scored for scored, _failure in results if scored is not None]
-            partial_failures = [failure for _scored, failure in results if failure is not None]
-            return scored_items, partial_failures
+        results = await asyncio.gather(*(_score_one(item) for item in scoring_items))
+        scored_items = [scored for scored, _failure in results if scored is not None]
+        partial_failures = [failure for _scored, failure in results if failure is not None]
+        return scored_items, partial_failures
 
     async def _review_news_candidates(
         self,
