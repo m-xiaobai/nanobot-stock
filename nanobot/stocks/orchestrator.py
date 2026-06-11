@@ -456,10 +456,7 @@ class StockSelectionSubagentOrchestrator:
                         task=self._build_market_scoring_task([item]),
                         trace_stage=False,
                     )
-                    raw_items = scoring.get("items")
-                    if not isinstance(raw_items, list) or len(raw_items) != 1:
-                        raise ValueError("expected exactly one scored item")
-                    scored_item = raw_items[0]
+                    scored_item = scoring
                     if not isinstance(scored_item, dict):
                         raise TypeError("scored item must be a JSON object")
                     scored_symbol = str(scored_item.get("symbol", ""))
@@ -467,6 +464,30 @@ class StockSelectionSubagentOrchestrator:
                         raise ValueError(
                             f"expected symbol {symbol}, got {scored_symbol or 'missing'}"
                         )
+                    expected_keys = {"symbol", "technical_score", "score_reasons", "risk_notes"}
+                    actual_keys = set(scored_item.keys())
+                    if actual_keys != expected_keys:
+                        raise ValueError(
+                            "market-scoring item keys mismatch: "
+                            f"expected {sorted(expected_keys)}, got {sorted(actual_keys)}"
+                        )
+
+                    technical_score_raw = scored_item["technical_score"]
+                    score_reasons_raw = scored_item["score_reasons"]
+                    risk_notes_raw = scored_item["risk_notes"]
+
+                    if not isinstance(technical_score_raw, int) or isinstance(technical_score_raw, bool):
+                        raise ValueError("market-scoring technical_score must be an integer")
+                    if not 0 <= technical_score_raw <= 100:
+                        raise ValueError("market-scoring technical_score must be between 0 and 100")
+                    if not isinstance(score_reasons_raw, list) or any(
+                        not isinstance(reason, str) for reason in score_reasons_raw
+                    ):
+                        raise ValueError("market-scoring score_reasons must be an array of strings")
+                    if not isinstance(risk_notes_raw, list) or any(
+                        not isinstance(note, str) for note in risk_notes_raw
+                    ):
+                        raise ValueError("market-scoring risk_notes must be an array of strings")
                     return scored_item, None
                 except Exception as exc:
                     return None, f"market scoring unavailable for {symbol}: {exc}"
