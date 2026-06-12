@@ -53,6 +53,7 @@ class NewsQueryRequest:
     symbol: str
     lookback_days: int
     anchor_date: date | None = None
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,6 @@ class ScreeningResult:
 class NewsFilteredStock:
     symbol: str
     allowed: bool
-    negative_news_flags: list[str]
     risk_notes: list[str]
 
 
@@ -94,7 +94,6 @@ class SelectedStockReport:
     symbol: str
     strategy_name: str
     screen_pass_reasons: list[str]
-    negative_news_flags: list[str]
     technical_score: int
     score_reasons: list[str]
     risk_notes: list[str]
@@ -124,6 +123,7 @@ class NewsDataAdapter(Protocol):
         symbol: str,
         lookback_days: int,
         anchor_date: date | str | None = None,
+        name: str | None = None,
     ) -> list[NewsArticle]: ...
 
 
@@ -178,7 +178,6 @@ class DailySelectionService:
                     symbol=result.symbol,
                     strategy_name=strategy.name,
                     screen_pass_reasons=result.screen_pass_reasons,
-                    negative_news_flags=filter_result.negative_news_flags,
                     technical_score=scored.technical_score,
                     score_reasons=scored.score_reasons,
                     risk_notes=[*scored.risk_notes, *filter_result.risk_notes],
@@ -311,7 +310,6 @@ class DailySelectionService:
                 NewsFilteredStock(
                     symbol=symbol,
                     allowed=True,
-                    negative_news_flags=[],
                     risk_notes=[message],
                 ),
                 message,
@@ -329,12 +327,9 @@ class DailySelectionService:
             return NewsFilteredStock(
                 symbol=symbol,
                 allowed=False,
-                negative_news_flags=[
-                    candidate.negative_news_flag for candidate in prescreened.candidate_articles
-                ],
                 risk_notes=["recent material negative news within 3 days"],
             )
-        return NewsFilteredStock(symbol=symbol, allowed=True, negative_news_flags=[], risk_notes=[])
+        return NewsFilteredStock(symbol=symbol, allowed=True, risk_notes=[])
 
     def _score_symbol(self, symbol: str, bars: list[PriceBar]) -> ScoredStock:
         if len(bars) < 6:

@@ -1,36 +1,28 @@
-"""Real A-share stock news adapter backed by Eastmoney and Sina."""
+"""Real A-share stock news adapter backed by Feedcoop/Volc web search."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 import json
 import re
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
 from typing import Callable
 
 import httpx
 
 from nanobot.stocks.service import NewsArticle, NewsDataAdapter
 
-_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
-)
 _TAG_RE = re.compile(r"<[^>]+>")
-_SINA_ENTRY_RE = re.compile(
-    r"<div class=\"datelist\"><span>(?P<time>[^<]+)</span></div>\s*"
-    r"<a href=\"(?P<url>[^\"]+)\"[^>]*>(?P<title>.*?)</a>",
-    re.IGNORECASE | re.DOTALL,
-)
+_SEARCH_URL = "https://open.feedcoopapi.com/search_api/web_search"
+_API_KEY = "54cfklYInzM5ZjqlvWcgviNcmB3swvkt"
 
 
 @dataclass
 class EastmoneySinaNewsAdapter(NewsDataAdapter):
-    """Fetch stock-specific news from Eastmoney with Sina fallback."""
+    """Fetch stock-specific news from Feedcoop/Volc web search."""
 
     timeout: float = 15.0
-    eastmoney_max_pages: int = 5
-    eastmoney_page_size: int = 20
+    result_count: int = 3
     current_date_provider: Callable[[], date | datetime | str] = field(
         default=lambda: date.today()
     )
@@ -40,133 +32,106 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         symbol: str,
         lookback_days: int,
         anchor_date: date | str | None = None,
+        name: str | None = None,
     ) -> list[NewsArticle]:
-        start_date, end_date = self._date_window(lookback_days, anchor_date)
-        eastmoney_error: Exception | None = None
+        # start_date, end_date = self._date_window(lookback_days, anchor_date)
+        articles = self._fetch_news_websearch(symbol, lookback_days, name=name)
+        # articles = self._filter_by_date(articles, start_date, end_date)
+        return self._dedupe_and_sort(articles)
 
-        try:
-            eastmoney_articles = self._fetch_news_eastmoney(symbol)
-        except Exception as exc:
-            eastmoney_error = exc
-            eastmoney_articles = []
-
-        eastmoney_articles = self._filter_by_date(eastmoney_articles, start_date, end_date)
-        if eastmoney_articles:
-            return eastmoney_articles
-
-        try:
-            sina_articles = self._fetch_news_sina(symbol)
-        except Exception as exc:
-            if eastmoney_error is not None:
-                raise RuntimeError(
-                    f"failed to fetch stock news for {symbol}: eastmoney={eastmoney_error}; sina={exc}"
-                ) from exc
-            raise RuntimeError(f"failed to fetch stock news for {symbol}: sina={exc}") from exc
-
-        sina_articles = self._filter_by_date(sina_articles, start_date, end_date)
-        if sina_articles:
-            return sina_articles
-
-        if eastmoney_error is not None:
-            raise RuntimeError(f"failed to fetch stock news for {symbol}: eastmoney={eastmoney_error}")
-        return []
-
-    def _fetch_news_eastmoney(self, symbol: str) -> list[NewsArticle]:
-        articles: list[NewsArticle] = []
-        seen: set[tuple[str, str, str]] = set()
-
-        for page_index in range(1, self.eastmoney_max_pages + 1):
-            page_articles = self._fetch_news_eastmoney_page(symbol, page_index=page_index)
-            if not page_articles:
-                break
-            for article in page_articles:
-                key = (article.title, article.published_at, article.source)
-                if key in seen:
-                    continue
-                seen.add(key)
-                articles.append(article)
-
-        return articles
-
-    def _fetch_news_eastmoney_page(self, symbol: str, *, page_index: int) -> list[NewsArticle]:
-        url = "https://search-api-web.eastmoney.com/search/jsonp"
-        inner_param = {
-            "uid": "",
-            "keyword": symbol,
-            "type": ["cmsArticleWebOld"],
-            "client": "web",
-            "clientType": "web",
-            "clientVersion": "curr",
-            "param": {
-                "cmsArticleWebOld": {
-                    "searchScope": "default",
-                    "sort": "default",
-                    "pageIndex": page_index,
-                    "pageSize": self.eastmoney_page_size,
-                    "preTag": "",
-                    "postTag": "",
-                }
-            },
-        }
-        response = httpx.get(
-            url,
-            params={"cb": "jQuery_news", "param": json.dumps(inner_param, separators=(",", ":"))},
-            headers={"User-Agent": _UA, "Referer": "https://so.eastmoney.com/"},
-            timeout=self.timeout,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(f"eastmoney http {response.status_code}")
-        text = response.text
-        start = text.find("(")
-        end = text.rfind(")")
-        if start < 0 or end <= start:
-            raise ValueError("invalid eastmoney jsonp payload")
-        payload = json.loads(text[start + 1 : end])
-        raw_articles = payload.get("result", {}).get("cmsArticleWebOld", [])
-        if isinstance(raw_articles, dict):
-            rows = raw_articles.get("list", [])
-        elif isinstance(raw_articles, list):
-            rows = raw_articles
-        else:
-            rows = []
-
+    def _fetch_news_websearch(
+        self,
+        symbol: str,
+        lookback_days: int,
+        *,
+        name: str | None = None,
+    ) -> list[NewsArticle]:
+        raw_articles = self._stream_web_summary(symbol, lookback_days, name=name)
         return [
             NewsArticle(
-                title=self._strip_html(row.get("title", "")),
-                summary=self._strip_html(row.get("content", ""))[:200],
-                published_at=self._normalize_time(row.get("date", "")),
-                source=self._strip_html(row.get("mediaName", "")),
+                title=self._strip_html(str(row.get("Title") or "")),
+                summary=self._strip_html(str(row.get("Summary") or row.get("Snippet") or "")),
+                published_at=self._normalize_time(str(row.get("PublishTime") or "")),
+                source=self._strip_html(str(row.get("SiteName") or "")),
             )
-            for row in rows
+            for row in raw_articles
+            if self._strip_html(str(row.get("Title") or "")).strip()
         ]
 
-    def _fetch_news_sina(self, symbol: str) -> list[NewsArticle]:
-        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
-        url = (
-            "https://vip.stock.finance.sina.com.cn/corp/view/"
-            f"vCB_AllNewsStock.php?symbol={prefix}{symbol}&Page=1"
-        )
-        response = httpx.get(
-            url,
-            headers={"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"},
-            timeout=self.timeout,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(f"sina http {response.status_code}")
-        rows: list[NewsArticle] = []
-        for match in _SINA_ENTRY_RE.finditer(response.text):
-            rows.append(
-                NewsArticle(
-                    title=self._strip_html(match.group("title")),
-                    summary="",
-                    published_at=self._normalize_sina_time(match.group("time")),
-                    source="新浪财经",
-                )
-            )
-        return rows
-
-    def _filter_by_date(
+    def _stream_web_summary(
         self,
+        symbol: str,
+        lookback_days: int,
+        *,
+        name: str | None = None,
+    ) -> list[dict[str, object]]:
+        web_results: list[dict[str, object]] = []
+        query = name+" "+symbol if name else symbol
+        with httpx.stream(
+            "POST",
+            _SEARCH_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_API_KEY}",
+            },
+            json={
+                "Query": f"{query} 新闻",
+                "SearchType": "web-summary",
+                "Count": self.result_count,
+                "Filter": {
+                    "NeedContent": False,
+                    "AuthInfoLevel": 2,
+                    "NeedUrl": True
+                },
+                "TimeRange": self._time_range_for_lookback(lookback_days),
+                "Industry": "finance",
+                
+                "NeedSummary": True
+            },
+            timeout=self.timeout,
+        ) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"feedcoop http {response.status_code}: {response.text}")
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                if isinstance(raw_line, bytes):
+                    try:
+                        line = raw_line.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                else:
+                    line = str(raw_line).strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                result = event.get("Result") or {}
+                current_results = result.get("WebResults")
+                if isinstance(current_results, list) and current_results:
+                    web_results = [
+                        row
+                        for row in current_results
+                        if self._coerce_auth_level(row.get("AuthInfoLevel")) >= 2
+                    ]
+        if not web_results:
+            raise ValueError("invalid feedcoop payload: missing WebResults")
+        return web_results
+
+    @staticmethod
+    def _coerce_auth_level(value: object) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+        self,
+    def _filter_by_date(
         articles: list[NewsArticle],
         start_date: date,
         end_date: date,
@@ -179,6 +144,17 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
             if start_date <= parsed <= end_date:
                 filtered.append(article)
         return filtered
+
+    def _dedupe_and_sort(self, articles: list[NewsArticle]) -> list[NewsArticle]:
+        deduped: list[NewsArticle] = []
+        seen: set[tuple[str, str, str]] = set()
+        for article in articles:
+            key = (article.title, article.published_at, article.source)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(article)
+        return sorted(deduped, key=self._sort_key, reverse=True)
 
     def _date_window(self, lookback_days: int, anchor_date: date | str | None = None) -> tuple[date, date]:
         end_date = self._coerce_date(anchor_date)
@@ -193,31 +169,41 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         return _TAG_RE.sub("", text or "").strip()
 
     @staticmethod
+    def _time_range_for_lookback(lookback_days: int) -> str:
+        if lookback_days <= 1:
+            return "OneDay"
+        if lookback_days <= 7:
+            return "OneWeek"
+        if lookback_days <= 30:
+            return "OneMonth"
+        if lookback_days <= 90:
+            return "ThreeMonths"
+        return "OneYear"
+
+    @staticmethod
     def _normalize_time(raw: str) -> str:
         raw = (raw or "").strip()
         for fmt_in, fmt_out in (
             ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"),
             ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M"),
             ("%Y-%m-%d", "%Y-%m-%d"),
+            ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"),
+            ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"),
         ):
             try:
                 return datetime.strptime(raw, fmt_in).strftime(fmt_out)
             except ValueError:
                 continue
-        return raw
-
-    @staticmethod
-    def _normalize_sina_time(raw: str) -> str:
-        raw = raw.strip()
-        for fmt_in in ("%Y年%m月%d日 %H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-            try:
-                parsed = datetime.strptime(raw, fmt_in)
-                if parsed.time() == datetime.min.time():
-                    return parsed.strftime("%Y-%m-%d")
-                return parsed.strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                continue
-        return raw
+        iso_raw = raw.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(iso_raw)
+        except ValueError:
+            return raw
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        if parsed.time() == datetime.min.time():
+            return parsed.strftime("%Y-%m-%d")
+        return parsed.strftime("%Y-%m-%d %H:%M")
 
     @staticmethod
     def _parse_article_date(raw: str) -> date | None:
@@ -228,6 +214,16 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
             except ValueError:
                 continue
         return None
+
+    @staticmethod
+    def _sort_key(article: NewsArticle) -> datetime:
+        raw = (article.published_at or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return datetime.min
 
     @staticmethod
     def _coerce_date(value: date | datetime | str | None) -> date | None:

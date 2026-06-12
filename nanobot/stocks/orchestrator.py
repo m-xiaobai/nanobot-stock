@@ -70,7 +70,7 @@ class StockSelectionSubagentOrchestrator:
     workspace: Path = Path(".")
     screening_only: bool = False
     news_filter_only: bool = True
-    lookback_days: int = 3
+    lookback_days: int = 7
     market_scoring_max_concurrency: int = 5
 
     async def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
@@ -87,48 +87,64 @@ class StockSelectionSubagentOrchestrator:
                     "market": self.market,
                 },
             ):
+                # stock screening
                 screened = await self._run_json_stage(
                     label="stock-screening",
                     stage="stock-screening",
                     task=self._build_stock_screening_task(strategy_name, trade_date),
                 )
-                if self.screening_only:
-                    return self._build_screening_only_report(
-                        strategy_name=strategy_name,
+                
+                # news filtering
+                with self._langfuse_span("prepare-news-filter-inputs"):
+                    review_items, auto_allowed_items = await self._prepare_news_filter_inputs(
+                        screened["items"],
                         trade_date=trade_date,
-                        screened=screened["items"],
                     )
-                # Temporarily disable the news-filter stage and pass stock-screening
-                # results directly into market-scoring.
-                # review_items, auto_allowed_items, prescreen_failures = self._prepare_news_filter_inputs(
-                #     [str(item["symbol"]) for item in screened["items"]],
-                #     trade_date=trade_date,
-                # )
-                # reviewed_items: list[dict[str, Any]] = []
-                # reviewed_failures: list[str] = []
-                # if review_items:
-                #     reviewed_items, reviewed_failures = await self._review_news_candidates(review_items)
-                # news_items = [*auto_allowed_items, *reviewed_items]
-                # partial_failures = [
-                #     *[str(item) for item in prescreen_failures],
-                #     *[str(item) for item in reviewed_failures],
-                # ]
-                # if self.news_filter_only:
-                #     return self._build_news_filter_only_report(
-                #         strategy_name=strategy_name,
-                #         trade_date=trade_date,
-                #         screened=screened["items"],
-                #         news_items=news_items,
-                #         partial_failures=partial_failures,
-                #     )
+                    self._langfuse_observation_payload(
+                        input_payload={
+                            "trade_date": trade_date.isoformat(),
+                            "screened_count": len(screened["items"]),
+                            "screened_items": screened["items"],
+                        },
+                        output_payload={
+                            "review_items_count": len(review_items),
+                            "review_items": review_items,
+                            "auto_allowed_items_count": len(auto_allowed_items),
+                            "auto_allowed_items": auto_allowed_items,
+                        },
+                    )
+                reviewed_items: list[dict[str, Any]] = []
+                news_filter_failures: list[str] = []
+                if review_items:
+                    with self._langfuse_span("news-filter"):
+                        reviewed_items, news_filter_failures = await self._review_news_candidates(review_items)
+                        self._langfuse_observation_payload(
+                            input_payload={
+                                "trade_date": trade_date.isoformat(),
+                                "review_items_count": len(review_items),
+                                "review_items": review_items,
+                            },
+                            output_payload={
+                                "reviewed_items_count": len(reviewed_items),
+                                "reviewed_items": reviewed_items,
+                                "news_filter_failures": news_filter_failures,
+                            },
+                        )
+                news_items = [*auto_allowed_items, *reviewed_items]
+                
+                #market scoring
                 with self._langfuse_span("prepare-market-scoring-inputs"):
-                    scoring_items, _ = await self._prepare_market_scoring_inputs(
-                        [str(item["symbol"]) for item in screened["items"] if item.get("symbol")],
+                    scoring_items = await self._prepare_market_scoring_inputs(
+                        [
+                            str(item["symbol"])
+                            for item in news_items
+                            if item.get("allowed") and item.get("symbol")
+                        ],
                         trade_date=trade_date,
                     )
                 
                 with self._langfuse_span("market-scoring"):
-                    scored_items, partial_failures = await self._score_market_items_individually(
+                    scored_items, market_scoring_failures = await self._score_market_items_individually(
                         scoring_items
                     )
 
@@ -137,7 +153,7 @@ class StockSelectionSubagentOrchestrator:
                         strategy_name=strategy_name,
                         trade_date=trade_date,
                         screened=screened["items"],
-                        news_items=[],
+                        news_items=news_items,
                         scoring_items=scored_items,
                     )
                     self._langfuse_observation_payload(
@@ -145,7 +161,7 @@ class StockSelectionSubagentOrchestrator:
                             "strategy_name": strategy_name,
                             "trade_date": trade_date.isoformat(),
                             "screened_count": len(screened["items"]),
-                            "news_items_count": 0,
+                            "news_items_count": len(news_items),
                             "scoring_items": scored_items,
                         },
                         output_payload={
@@ -183,7 +199,7 @@ class StockSelectionSubagentOrchestrator:
                     global_risk_disclaimer=(
                         "仅供研究参考，不构成任何投资建议。"
                     ),
-                    partial_failures=partial_failures,
+                    partial_failures=[*news_filter_failures, *market_scoring_failures],
                 )
 
     async def _run_json_stage(
@@ -321,7 +337,6 @@ class StockSelectionSubagentOrchestrator:
                 symbol=str(item["symbol"]),
                 strategy_name=str(item.get("strategy_name") or strategy_name),
                 screen_pass_reasons=[],
-                negative_news_flags=[],
                 technical_score=0,
                 score_reasons=[],
                 risk_notes=[],
@@ -364,7 +379,6 @@ class StockSelectionSubagentOrchestrator:
                     symbol=symbol,
                     strategy_name=str(item.get("strategy_name") or strategy_name),
                     screen_pass_reasons=[],
-                    negative_news_flags=[str(flag) for flag in news_raw.get("negative_news_flags", [])],
                     technical_score=0,
                     score_reasons=[],
                     risk_notes=[
@@ -386,7 +400,7 @@ class StockSelectionSubagentOrchestrator:
             global_risk_disclaimer=(
                 "仅供研究参考，本结果不构成任何投资建议。"
             ),
-            partial_failures=[],
+            partial_failures=partial_failures,
         )
 
     def _build_stage_system_prompt(self, stage: str) -> str:
@@ -501,98 +515,140 @@ class StockSelectionSubagentOrchestrator:
         self,
         review_items: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[str]]:
+        async def _review_one(item: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+            symbol = str(item.get("symbol", ""))
+            try:
+                reviewed_news = await self._run_json_stage(
+                    label="news-filter",
+                    stage="news-filter",
+                    task=self._build_news_filter_task([item]),
+                )
+                reviewed_items_raw = reviewed_news.get("items", [])
+                if not isinstance(reviewed_items_raw, list):
+                    raise ValueError("news-filter items must be an array")
+
+                validated_items: list[dict[str, Any]] = []
+                for reviewed_item in reviewed_items_raw:
+                    if not isinstance(reviewed_item, dict):
+                        raise TypeError("news-filter item must be a JSON object")
+                    reviewed_symbol = str(reviewed_item.get("symbol", ""))
+                    if reviewed_symbol != symbol:
+                        raise ValueError(
+                            f"expected symbol {symbol}, got {reviewed_symbol or 'missing'}"
+                        )
+                    expected_keys = {"symbol", "name", "allowed", "risk_notes"}
+                    actual_keys = set(reviewed_item.keys())
+                    if actual_keys != expected_keys:
+                        raise ValueError(
+                            "news-filter item keys mismatch: "
+                            f"expected {sorted(expected_keys)}, got {sorted(actual_keys)}"
+                        )
+
+                    name_raw = reviewed_item["name"]
+                    allowed_raw = reviewed_item["allowed"]
+                    risk_notes_raw = reviewed_item["risk_notes"]
+
+                    if not isinstance(name_raw, str):
+                        raise ValueError("news-filter name must be a string")
+                    if not isinstance(allowed_raw, bool):
+                        raise ValueError("news-filter allowed must be a boolean")
+                    if not isinstance(risk_notes_raw, list) or any(
+                        not isinstance(note, str) for note in risk_notes_raw
+                    ):
+                        raise ValueError("news-filter risk_notes must be an array of strings")
+                    validated_items.append(reviewed_item)
+
+                partial_failures_raw = reviewed_news.get("partial_failures", [])
+                if not isinstance(partial_failures_raw, list) or any(
+                    not isinstance(failure, str) for failure in partial_failures_raw
+                ):
+                    raise ValueError("news-filter partial_failures must be an array of strings")
+                return validated_items, [str(failure) for failure in partial_failures_raw]
+            except Exception as exc:
+                return [], [f"news-filter unavailable for {symbol}: {exc}"]
+
+        reviewed_groups = await asyncio.gather(*(_review_one(item) for item in review_items))
         reviewed_items: list[dict[str, Any]] = []
         partial_failures: list[str] = []
-
-        for item in review_items:
-            reviewed_news = await self._run_json_stage(
-                label="news-filter",
-                stage="news-filter",
-                task=self._build_news_filter_task([item]),
-            )
-            reviewed_items.extend(reviewed_news.get("items", []))
-            partial_failures.extend([str(entry) for entry in reviewed_news.get("partial_failures", [])])
-
+        for group_items, group_failures in reviewed_groups:
+            reviewed_items.extend(group_items)
+            partial_failures.extend(group_failures)
         return reviewed_items, partial_failures
 
-    def _prepare_news_filter_inputs(
+    async def _prepare_news_filter_inputs(
         self,
-        symbols: list[str],
+        symbols: list[dict[str, Any]],
         trade_date: date | None = None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         review_items: list[dict[str, Any]] = []
         auto_allowed_items: list[dict[str, Any]] = []
-        partial_failures: list[str] = []
 
         if self.news_data is None:
             for symbol in symbols:
                 review_items.append(
                     {
-                        "symbol": symbol,
+                        "symbol": symbol.get("symbol", ""),
+                        "name": symbol.get("name", ""),
                         "has_negative_candidates": False,
                         "candidate_articles": [],
                     }
                 )
-            return review_items, auto_allowed_items, partial_failures
+            return review_items, auto_allowed_items
 
-        for symbol in symbols:
+        async def _prepare_one(symbol: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            symbol_code = str(symbol.get("symbol", ""))
+            symbol_name = str(symbol.get("name", ""))
             try:
-                raw_articles = self.news_data.get_news(
-                    symbol,
+                raw_articles = await asyncio.to_thread(
+                    self.news_data.get_news,
+                    symbol_code,
                     self.lookback_days,
-                    anchor_date=trade_date,
+                    trade_date,
+                    symbol_name,
                 )
             except Exception as exc:
                 message = f"news data unavailable for {symbol}: {exc}"
-                partial_failures.append(message)
-                auto_allowed_items.append(
-                    {
-                        "symbol": symbol,
-                        "allowed": True,
-                        "decision": "REVIEW",
-                        "matched_categories": [],
-                        "negative_news_flags": [],
-                        "risk_notes": [message],
-                        "evidence": [],
-                    }
-                )
-                continue
-
-            prescreened = prescreen_negative_news(symbol, adapt_news_articles(raw_articles))
-            if not prescreened.has_negative_candidates:
-                auto_allowed_items.append(
-                    {
-                        "symbol": symbol,
-                        "allowed": True,
-                        "decision": "PASS",
-                        "matched_categories": [],
-                        "negative_news_flags": [],
-                        "risk_notes": [],
-                        "evidence": [],
-                    }
-                )
-                continue
-
-            review_items.append(
-                {
-                    "symbol": symbol,
-                    "has_negative_candidates": True,
-                    "candidate_articles": [
-                        self._candidate_article_to_dict(article)
-                        for article in prescreened.candidate_articles
-                    ],
+                return None, {
+                    "symbol": symbol_code,
+                    "name": symbol_name,
+                    "allowed": True,
+                    "risk_notes": [message],
                 }
-            )
 
-        return review_items, auto_allowed_items, partial_failures
+            prescreened = prescreen_negative_news(symbol_code, adapt_news_articles(raw_articles))
+            if not prescreened.has_negative_candidates:
+                return None, {
+                    "symbol": symbol_code,
+                    "name": symbol_name,
+                    "allowed": True,
+                    "risk_notes": [],
+                }
+
+            return {
+                "symbol": symbol_code,
+                "name": symbol_name,
+                "has_negative_candidates": True,
+                "candidate_articles": [
+                    self._candidate_article_to_dict(article)
+                    for article in prescreened.candidate_articles
+                ],
+            }, None
+
+        results = await asyncio.gather(*(_prepare_one(symbol) for symbol in symbols))
+        for review_item, auto_allowed_item in results:
+            if review_item is not None:
+                review_items.append(review_item)
+            if auto_allowed_item is not None:
+                auto_allowed_items.append(auto_allowed_item)
+
+        return review_items, auto_allowed_items
 
     async def _prepare_market_scoring_inputs(
         self,
         symbols: list[str],
         trade_date: date | None = None,
-    ) -> tuple[list[dict[str, Any]], list[str]]:
+    ) -> list[dict[str, Any]]:
         scoring_items: list[dict[str, Any]] = []
-        partial_failures: list[str] = []
 
         if self.technical_data is None:
             technical_snapshots: dict[str, dict[str, Any]] | None = None
@@ -613,8 +669,6 @@ class StockSelectionSubagentOrchestrator:
                 }
             except Exception as exc:
                 technical_snapshots = {}
-                message = f"technical data unavailable for batch {symbols}: {exc}"
-                partial_failures.append(message)
 
         for symbol in symbols:
             technical_snapshot: dict[str, Any]
@@ -626,15 +680,10 @@ class StockSelectionSubagentOrchestrator:
             else:
                 technical_snapshot = technical_snapshots.get(symbol) if technical_snapshots is not None else None
                 if technical_snapshot is None:
-                    if partial_failures and partial_failures[-1].startswith("technical data unavailable for batch "):
-                        message = f"technical data unavailable for {symbol}: batch request failed"
-                    else:
-                        message = (
-                            f"technical data unavailable for {symbol}: "
-                            "snapshot missing from batch response"
-                        )
-                    if message not in partial_failures:
-                        partial_failures.append(message)
+                    message = (
+                        f"technical data unavailable for {symbol}: "
+                        "snapshot missing from batch response"
+                    )
                     technical_snapshot = self._build_unavailable_technical_snapshot(symbol, message)
 
             scoring_snapshot = self._flatten_scoring_snapshot(technical_snapshot)
@@ -645,7 +694,7 @@ class StockSelectionSubagentOrchestrator:
                 }
             )
 
-        return scoring_items, partial_failures
+        return scoring_items
 
     @staticmethod
     def _flatten_scoring_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -697,8 +746,9 @@ class StockSelectionSubagentOrchestrator:
         news_items: list[dict[str, Any]],
         scoring_items: list[dict[str, Any]],
     ) -> list[SelectedStockReport]:
-        del screened, news_items
+        del screened
         selected: list[SelectedStockReport] = []
+        news_by_symbol = {str(item["symbol"]): item for item in news_items if item.get("symbol")}
 
         for scoring_raw in scoring_items:
             scoring = ScoredStock(
@@ -707,15 +757,18 @@ class StockSelectionSubagentOrchestrator:
                 score_reasons=[str(reason) for reason in scoring_raw.get("score_reasons", [])],
                 risk_notes=[str(note) for note in scoring_raw.get("risk_notes", [])],
             )
+            news_raw = news_by_symbol.get(scoring.symbol, {})
             selected.append(
                 SelectedStockReport(
                     symbol=scoring.symbol,
                     strategy_name=strategy_name,
                     screen_pass_reasons=[],
-                    negative_news_flags=[],
                     technical_score=scoring.technical_score,
                     score_reasons=scoring.score_reasons,
-                    risk_notes=scoring.risk_notes,
+                    risk_notes=[
+                        *[str(note) for note in news_raw.get("risk_notes", [])],
+                        *scoring.risk_notes,
+                    ],
                     report_date=trade_date,
                 )
             )

@@ -46,10 +46,16 @@ class _FakeExecutor:
 class _FakeNewsAdapter:
     def __init__(self, articles_by_symbol: dict[str, list[NewsArticle] | Exception]) -> None:
         self._articles_by_symbol = articles_by_symbol
-        self.calls: list[tuple[str, int, object | None]] = []
+        self.calls: list[tuple[str, int, object | None, str | None]] = []
 
-    def get_news(self, symbol: str, lookback_days: int, anchor_date: object | None = None) -> list[NewsArticle]:
-        self.calls.append((symbol, lookback_days, anchor_date))
+    def get_news(
+        self,
+        symbol: str,
+        lookback_days: int,
+        anchor_date: object | None = None,
+        name: str | None = None,
+    ) -> list[NewsArticle]:
+        self.calls.append((symbol, lookback_days, anchor_date, name))
         result = self._articles_by_symbol.get(symbol, [])
         if isinstance(result, Exception):
             raise result
@@ -140,7 +146,7 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
             """,
             """
             {"items":[
-              {"symbol":"600001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]}
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,"risk_notes":[]}
             ],"partial_failures":[]}
             """,
             """
@@ -180,7 +186,6 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
     assert report.selected_stocks[0].technical_score == 91
     assert report.selected_stocks[0].screen_pass_reasons == []
-    assert report.selected_stocks[0].negative_news_flags == []
     assert report.selected_stocks[0].risk_notes == ["watch for next-day follow-through"]
     assert report.summary.startswith("市场评分已完成")
     assert report.global_risk_disclaimer == "仅供研究参考，不构成任何投资建议。"
@@ -220,7 +225,7 @@ async def test_orchestrator_defaults_to_screening_only_mode() -> None:
     assert report.selected_stocks[0].technical_score == 0
     assert report.summary == "Screening-only mode: 2 candidate(s) passed stock-screening."
     assert report.global_risk_disclaimer == "For research use only. This screening-only report is not investment advice."
-    assert report.partial_failures == ["screening_only mode enabled; skipped news-filter, market-scoring, report-summary"]
+    assert report.partial_failures == []
 
 
 @pytest.mark.asyncio
@@ -237,9 +242,9 @@ async def test_orchestrator_can_stop_after_news_filter_stage() -> None:
             """,
             """
             {"items":[
-              {"symbol":"600001","allowed":true,"decision":"PASS","matched_categories":[],"negative_news_flags":[],"risk_notes":[],"evidence":[]},
-              {"symbol":"000001","allowed":false,"decision":"REJECT","matched_categories":["regulatory investigation or administrative penalty"],
-               "negative_news_flags":["CSRC investigation"],"risk_notes":["recent material negative news within 3 days"],"evidence":[]}
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,"risk_notes":[]},
+              {"symbol":"000001","name":"Beta Bank","allowed":false,
+               "risk_notes":["recent material negative news within 3 days"]}
             ],"partial_failures":[]}
             """,
         ]
@@ -259,11 +264,10 @@ async def test_orchestrator_can_stop_after_news_filter_stage() -> None:
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
     assert report.selected_stocks[0].screen_pass_reasons == []
     assert report.selected_stocks[0].technical_score == 0
-    assert report.selected_stocks[0].negative_news_flags == []
     assert report.selected_stocks[0].risk_notes == []
     assert report.summary == "News-filter-only mode: 1 candidate(s) passed stock-screening and news-filter."
     assert report.global_risk_disclaimer == "For research use only. This news-filter-only report is not investment advice."
-    assert report.partial_failures == ["news_filter_only mode enabled; skipped market-scoring, report-summary"]
+    assert report.partial_failures == ["news source timeout for 000001"]
 
 
 @pytest.mark.asyncio
@@ -299,7 +303,7 @@ def test_orchestrator_stage_prompts_define_roles_contracts_and_fail_safes() -> N
     assert '"partial_failures":[]' in news_prompt
     assert "items=" in news_prompt
     assert '"candidate_articles"' in news_prompt
-    assert '"decision":"PASS"' in news_prompt
+    assert '"allowed":true' in news_prompt
 
     assert "技术评分" in scoring_prompt
     assert "items=" in scoring_prompt
@@ -330,7 +334,7 @@ def test_merge_stage_outputs_uses_only_market_scoring_and_keeps_top_ten() -> Non
             {"symbol": "placeholder", "strategy_name": "B1", "screen_pass_reasons": [], "risk_notes": []}
         ],
         news_items=[
-            {"symbol": "placeholder", "allowed": True, "negative_news_flags": [], "risk_notes": []}
+            {"symbol": "placeholder", "name": "Placeholder Corp", "allowed": True, "risk_notes": []}
         ],
         scoring_items=scoring_items,
     )
@@ -349,7 +353,6 @@ def test_merge_stage_outputs_uses_only_market_scoring_and_keeps_top_ten() -> Non
     ]
     assert [item.technical_score for item in selected] == [96, 92, 90, 88, 84, 81, 77, 71, 67, 63]
     assert all(item.screen_pass_reasons == [] for item in selected)
-    assert all(item.negative_news_flags == [] for item in selected)
 
 
 @pytest.mark.asyncio
@@ -541,7 +544,7 @@ async def test_orchestrator_ignores_langfuse_when_context_is_unavailable(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_skips_single_symbol_market_scoring_failures_and_records_partial_failures() -> None:
+async def test_orchestrator_skips_single_symbol_market_scoring_failures_and_returns_empty_partial_failures() -> None:
     executor = _FakeExecutor(
         responses=[
             """
@@ -578,7 +581,9 @@ async def test_orchestrator_skips_single_symbol_market_scoring_failures_and_reco
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
-    assert report.partial_failures == ["market scoring unavailable for 000001: expected exactly one scored item"]
+    assert report.partial_failures == [
+        "market scoring unavailable for 000001: list index out of range"
+    ]
 
 
 @pytest.mark.asyncio
@@ -697,7 +702,7 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
     assert "Do not invent extra fields" in summary_system
 
 
-def test_orchestrator_prescreens_news_and_only_escalates_candidate_hits() -> None:
+async def test_orchestrator_prescreens_news_and_escalates_articles_old_excludes_would_have_suppressed() -> None:
     news_data = _FakeNewsAdapter(
         {
             "600001": [
@@ -709,9 +714,9 @@ def test_orchestrator_prescreens_news_and_only_escalates_candidate_hits() -> Non
             ],
             "000001": [
                 NewsArticle(
-                    title="000001接待机构调研",
+                    title="000001收到证监会监管函并披露机构调研纪要",
                     published_at="2026-06-01T09:30:00+08:00",
-                    summary="本次机构调研围绕新品发布和产能规划展开。",
+                    summary="公司披露监管函相关事项，并附机构调研纪要说明。",
                 )
             ],
         }
@@ -721,15 +726,17 @@ def test_orchestrator_prescreens_news_and_only_escalates_candidate_hits() -> Non
         news_data=news_data,
     )
 
-    review_items, auto_allowed_items, partial_failures = orchestrator._prepare_news_filter_inputs(
-        ["600001", "000001"],
+    review_items, auto_allowed_items = await orchestrator._prepare_news_filter_inputs(
+        [
+            {"symbol": "600001", "name": ""},
+            {"symbol": "000001", "name": ""},
+        ],
         trade_date=date(2026, 5, 26),
     )
-
-    assert partial_failures == []
     assert review_items == [
         {
             "symbol": "600001",
+            "name": "",
             "has_negative_candidates": True,
             "candidate_articles": [
                 {
@@ -740,22 +747,26 @@ def test_orchestrator_prescreens_news_and_only_escalates_candidate_hits() -> Non
                     "rule_severity": "high",
                 }
             ],
-        }
-    ]
-    assert auto_allowed_items == [
+        },
         {
             "symbol": "000001",
-            "allowed": True,
-            "decision": "PASS",
-            "matched_categories": [],
-            "negative_news_flags": [],
-            "risk_notes": [],
-            "evidence": [],
+            "name": "",
+            "has_negative_candidates": True,
+            "candidate_articles": [
+                {
+                    "date": "2026-06-01",
+                    "title": "000001收到证监会监管函并披露机构调研纪要",
+                    "matched_keywords": ["监管函", "证监会"],
+                    "candidate_categories": ["regulatory investigation or administrative penalty"],
+                    "rule_severity": "high",
+                }
+            ],
         }
     ]
+    assert auto_allowed_items == []
     assert news_data.calls == [
-        ("600001", 3, date(2026, 5, 26)),
-        ("000001", 3, date(2026, 5, 26)),
+        ("600001", 3, date(2026, 5, 26), "Alpha Corp"),
+        ("000001", 3, date(2026, 5, 26), "Beta Bank"),
     ]
 
 @pytest.mark.asyncio
@@ -931,16 +942,10 @@ async def test_orchestrator_accepts_expanded_news_filter_contract_and_preserves_
             """,
             """
             {"items":[
-              {"symbol":"600001","allowed":true,"decision":"REVIEW",
-               "matched_categories":["debt or litigation risk"],
-               "negative_news_flags":["minor litigation review"],
-               "risk_notes":["recent negative headlines need manual attention"],
-               "evidence":[{"date":"2026-06-01","title":"诉讼已受理","category":"debt or litigation risk","severity":"medium"}]},
-              {"symbol":"000001","allowed":false,"decision":"REJECT",
-               "matched_categories":["regulatory investigation or administrative penalty"],
-               "negative_news_flags":["CSRC investigation"],
-               "risk_notes":["recent material negative news within 3 days"],
-               "evidence":[{"date":"2026-06-01","title":"收到立案告知书","category":"regulatory investigation or administrative penalty","severity":"high"}]}
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,
+               "risk_notes":["recent negative headlines need manual attention"]},
+              {"symbol":"000001","name":"Beta Bank","allowed":false,
+               "risk_notes":["recent material negative news within 3 days"]}
             ],
             "partial_failures":["news source timeout for 000001"]}
             """,
@@ -962,9 +967,8 @@ async def test_orchestrator_accepts_expanded_news_filter_contract_and_preserves_
     report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
 
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
-    assert report.selected_stocks[0].negative_news_flags == []
     assert report.selected_stocks[0].risk_notes == []
-    assert report.partial_failures == ["news source timeout for 000001"]
+    assert report.partial_failures == []
 
 
 @pytest.mark.asyncio
@@ -981,18 +985,14 @@ async def test_orchestrator_reviews_each_prescreen_hit_in_a_separate_news_filter
             """,
             """
             {"items":[
-              {"symbol":"600001","allowed":true,"decision":"PASS",
-               "matched_categories":["regulatory investigation or administrative penalty"],
-               "negative_news_flags":["CSRC investigation"],
-               "risk_notes":[],"evidence":[]}
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,
+               "risk_notes":[]}
             ],"partial_failures":[]}
             """,
             """
             {"items":[
-              {"symbol":"000001","allowed":false,"decision":"REJECT",
-               "matched_categories":["major reduction plan or lockup-expiry pressure"],
-               "negative_news_flags":["major shareholder reduction plan"],
-               "risk_notes":["recent material negative news within 3 days"],"evidence":[]}
+              {"symbol":"000001","name":"Beta Bank","allowed":false,
+               "risk_notes":["recent material negative news within 3 days"]}
             ],"partial_failures":[]}
             """,
             """
@@ -1040,3 +1040,34 @@ async def test_orchestrator_reviews_each_prescreen_hit_in_a_separate_news_filter
     assert '"symbol": "000001"' not in news_filter_calls[0]
     assert '"symbol": "000001"' in news_filter_calls[1]
     assert [item.symbol for item in report.selected_stocks] == ["600001"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_validates_news_filter_item_contract() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","strategy_name":"B1",
+               "screen_pass_reasons":["close broke above the recent range high"],"risk_notes":[]}
+            ]}
+            """,
+            """
+            {"items":[
+              {"symbol":"600001","allowed":true,"risk_notes":[]}
+            ],"partial_failures":[]}
+            """,
+        ]
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        news_filter_only=True,
+    )
+
+    report = await orchestrator.run_daily_stock_selection("B1", date(2026, 5, 26))
+
+    assert report.selected_stocks == []
+    assert report.partial_failures == [
+        "news-filter unavailable for 600001: news-filter item keys mismatch: expected ['allowed', 'name', 'risk_notes', 'symbol'], got ['allowed', 'risk_notes', 'symbol']"
+    ]

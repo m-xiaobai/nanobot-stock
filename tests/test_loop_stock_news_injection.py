@@ -30,8 +30,6 @@ def test_agent_loop_injects_real_stock_news_adapter(tmp_path) -> None:
         loop.stock_selection_orchestrator.news_data.__class__.__name__
         == "EastmoneySinaNewsAdapter"
     )
-
-
 def test_agent_loop_injects_real_stock_technical_adapter(tmp_path) -> None:
     fake_loguru = types.ModuleType("loguru")
     fake_loguru.logger = MagicMock()

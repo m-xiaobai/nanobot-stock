@@ -33,10 +33,16 @@ class _FakeMarketDataAdapter:
 class _FakeNewsAdapter:
     def __init__(self, articles_by_symbol: dict[str, list[NewsArticle] | Exception]) -> None:
         self._articles_by_symbol = articles_by_symbol
-        self.calls: list[tuple[str, int, object | None]] = []
+        self.calls: list[tuple[str, int, object | None, str | None]] = []
 
-    def get_news(self, symbol: str, lookback_days: int, anchor_date: object | None = None) -> list[NewsArticle]:
-        self.calls.append((symbol, lookback_days, anchor_date))
+    def get_news(
+        self,
+        symbol: str,
+        lookback_days: int,
+        anchor_date: object | None = None,
+        name: str | None = None,
+    ) -> list[NewsArticle]:
+        self.calls.append((symbol, lookback_days, anchor_date, name))
         result = self._articles_by_symbol.get(symbol, [])
         if isinstance(result, Exception):
             raise result
@@ -162,28 +168,26 @@ def test_filter_negative_news_marks_and_excludes_negative_stocks() -> None:
         NewsFilteredStock(
             symbol="600001",
             allowed=False,
-            negative_news_flags=["CSRC investigation"],
             risk_notes=["recent material negative news within 3 days"],
         ),
         NewsFilteredStock(
             symbol="600002",
             allowed=True,
-            negative_news_flags=[],
             risk_notes=[],
         ),
     ]
 
 
-def test_filter_negative_news_ignores_false_positive_institutional_research() -> None:
+def test_filter_negative_news_articles_that_only_old_excludes_would_have_suppressed() -> None:
     service = _service(
         universe=["600001"],
         price_map={"600001": []},
         articles_by_symbol={
             "600001": [
                 NewsArticle(
-                    title="600001接待机构调研",
+                    title="600001收到证监会监管函并披露机构调研纪要",
                     published_at="2026-05-25",
-                    summary="本次机构调研围绕新产品进展和未来产能规划展开。",
+                    summary="公司披露监管函相关事项，并附机构调研纪要说明。",
                 )
             ]
         },
@@ -194,9 +198,8 @@ def test_filter_negative_news_ignores_false_positive_institutional_research() ->
     assert results == [
         NewsFilteredStock(
             symbol="600001",
-            allowed=True,
-            negative_news_flags=[],
-            risk_notes=[],
+            allowed=False,
+            risk_notes=["recent material negative news within 3 days"],
         )
     ]
 
@@ -222,7 +225,6 @@ def test_filter_negative_news_handles_major_shareholder_reduction_plan() -> None
         NewsFilteredStock(
             symbol="600001",
             allowed=False,
-            negative_news_flags=["major shareholder reduction plan"],
             risk_notes=["recent material negative news within 3 days"],
         )
     ]
@@ -343,7 +345,7 @@ def test_run_daily_stock_selection_anchors_news_window_on_trade_date() -> None:
 
     service.run_daily_stock_selection("B1", date(2026, 5, 26))
 
-    assert news_data.calls == [("600001", 3, date(2026, 5, 26))]
+    assert news_data.calls == [("600001", 3, date(2026, 5, 26), None)]
 
 
 def test_screen_stocks_b2_strategy_is_deterministic() -> None:
