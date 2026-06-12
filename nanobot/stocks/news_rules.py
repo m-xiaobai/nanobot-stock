@@ -18,6 +18,8 @@ class NegativeRule:
 @dataclass(frozen=True)
 class CandidateArticle:
     title: str
+    summary: str
+    source: str
     date: str
     matched_keywords: list[str]
     candidate_categories: list[str]
@@ -111,6 +113,8 @@ def prescreen_negative_news(symbol: str, articles: list[AdaptedNewsArticle]) -> 
             candidates.append(
                 CandidateArticle(
                     title=article.title,
+                    summary=article.summary,
+                    source=article.source,
                     date=article.published_at[:10],
                     matched_keywords=matched_keywords,
                     candidate_categories=[rule.category],

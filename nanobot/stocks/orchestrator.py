@@ -218,9 +218,9 @@ class StockSelectionSubagentOrchestrator:
                     label=label,
                     temperature=0.0,
                     extra_system_prompt=self._build_stage_system_prompt(stage),
-                    allow_builtin_tools=stage != "market-scoring",
-                    allow_mcp_tools=stage != "market-scoring",
-                    use_lightweight_system_prompt=stage == "market-scoring",
+                    allow_builtin_tools=stage not in {"news-filter", "market-scoring"},
+                    allow_mcp_tools=stage not in {"news-filter", "market-scoring"},
+                    use_lightweight_system_prompt=stage in {"news-filter", "market-scoring"},
                 )
         parsed = self._extract_json(raw, stage)
         if not isinstance(parsed, dict):
@@ -522,6 +522,7 @@ class StockSelectionSubagentOrchestrator:
                     label="news-filter",
                     stage="news-filter",
                     task=self._build_news_filter_task([item]),
+                    trace_stage=False,
                 )
                 reviewed_items_raw = reviewed_news.get("items", [])
                 if not isinstance(reviewed_items_raw, list):
@@ -726,9 +727,9 @@ class StockSelectionSubagentOrchestrator:
         return {
             "date": article.date,
             "title": article.title,
-            "matched_keywords": list(article.matched_keywords),
+            "summary": article.summary,
+            "source": article.source,
             "candidate_categories": list(article.candidate_categories),
-            "rule_severity": article.rule_severity,
         }
 
     def _build_report_summary_task(self, selected_symbols: list[str]) -> str:

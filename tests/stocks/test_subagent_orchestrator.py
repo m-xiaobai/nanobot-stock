@@ -177,6 +177,15 @@ async def test_orchestrator_runs_four_subagent_stages_and_merges_report() -> Non
         for label, task, _system, allow_builtin_tools, allow_mcp_tools, use_lightweight_system_prompt in executor.calls
         if label == "market-scoring"
     ]
+    news_filter_calls = [
+        (task, allow_builtin_tools, allow_mcp_tools, use_lightweight_system_prompt)
+        for label, task, _system, allow_builtin_tools, allow_mcp_tools, use_lightweight_system_prompt in executor.calls
+        if label == "news-filter"
+    ]
+    assert len(news_filter_calls) == 1
+    assert news_filter_calls[0][1] is False
+    assert news_filter_calls[0][2] is False
+    assert news_filter_calls[0][3] is True
     assert len(market_scoring_calls) == 1
     assert market_scoring_calls[0][0].count('"technical_snapshot"') == 1
     assert market_scoring_calls[0][1] is False
@@ -742,9 +751,9 @@ async def test_orchestrator_prescreens_news_and_escalates_articles_old_excludes_
                 {
                     "date": "2026-06-01",
                     "title": "600001收到证监会立案告知书",
-                    "matched_keywords": ["立案", "证监会", "调查"],
+                    "summary": "公司涉嫌信息披露违法违规，被证监会立案调查。",
+                    "source": "东方财富网",
                     "candidate_categories": ["regulatory investigation or administrative penalty"],
-                    "rule_severity": "high",
                 }
             ],
         },
@@ -756,9 +765,9 @@ async def test_orchestrator_prescreens_news_and_escalates_articles_old_excludes_
                 {
                     "date": "2026-06-01",
                     "title": "000001收到证监会监管函并披露机构调研纪要",
-                    "matched_keywords": ["监管函", "证监会"],
+                    "summary": "公司收到监管函，同时披露机构调研纪要。",
+                    "source": "东方财富网",
                     "candidate_categories": ["regulatory investigation or administrative penalty"],
-                    "rule_severity": "high",
                 }
             ],
         }
