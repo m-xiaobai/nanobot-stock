@@ -110,7 +110,7 @@ def test_real_news_adapter_raises_when_http_request_fails(
         adapter.get_news("600001", 7)
 
 
-def test_real_news_adapter_raises_when_payload_is_missing_web_results(
+def test_real_news_adapter_returns_empty_when_payload_is_missing_web_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_stream(method: str, url: str, **kwargs: object) -> _FakeStreamContext:
@@ -129,8 +129,7 @@ def test_real_news_adapter_raises_when_payload_is_missing_web_results(
 
     adapter = EastmoneySinaNewsAdapter(current_date_provider=lambda: "2026-06-01")
 
-    with pytest.raises(ValueError, match="missing WebResults"):
-        adapter.get_news("600001", 7)
+    assert adapter.get_news("600001", 7) == []
 
 
 def test_real_news_adapter_prefers_trade_date_for_lookback_window(

@@ -607,7 +607,8 @@ class StockSelectionSubagentOrchestrator:
                     symbol_name,
                 )
             except Exception as exc:
-                message = f"news data unavailable for {symbol}: {exc}"
+                display_name = f"{symbol_code} ({symbol_name})" if symbol_name else symbol_code
+                message = f"news data unavailable for {display_name}: {exc}"
                 return None, {
                     "symbol": symbol_code,
                     "name": symbol_name,

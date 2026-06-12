@@ -14,7 +14,7 @@ from nanobot.stocks.service import NewsArticle, NewsDataAdapter
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SEARCH_URL = "https://open.feedcoopapi.com/search_api/web_search"
-_API_KEY = "54cfklYInzM5ZjqlvWcgviNcmB3swvkt"
+_API_KEY = "BfbCJcg4wSObdCMEihGvKovrUjbZNmAF"
 
 
 @dataclass
@@ -76,7 +76,7 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
             },
             json={
                 "Query": f"{query} 新闻",
-                "SearchType": "web-summary",
+                "SearchType": "web_summary",
                 "Count": self.result_count,
                 "Filter": {
                     "NeedContent": False,
@@ -117,10 +117,10 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
                     web_results = [
                         row
                         for row in current_results
-                        if self._coerce_auth_level(row.get("AuthInfoLevel")) >= 2
+                        if self._coerce_auth_level(row.get("AuthInfoLevel")) <= 2
                     ]
         if not web_results:
-            raise ValueError("invalid feedcoop payload: missing WebResults")
+            return []
         return web_results
 
     @staticmethod
