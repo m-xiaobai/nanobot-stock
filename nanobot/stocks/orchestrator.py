@@ -617,22 +617,22 @@ class StockSelectionSubagentOrchestrator:
                     "risk_notes": [message],
                 }
 
-            prescreened = prescreen_negative_news(symbol_code, adapt_news_articles(raw_articles))
-            if not prescreened.has_negative_candidates:
-                return None, {
-                    "symbol": symbol_code,
-                    "name": symbol_name,
-                    "allowed": True,
-                    "risk_notes": [],
-                }
+            adapted_articles = adapt_news_articles(raw_articles)
+            # prescreened = prescreen_negative_news(symbol_code, adapted_articles)
+            # if not prescreened.has_negative_candidates:
+            #     return None, {
+            #         "symbol": symbol_code,
+            #         "name": symbol_name,
+            #         "allowed": True,
+            #         "risk_notes": [],
+            #     }
 
             return {
                 "symbol": symbol_code,
                 "name": symbol_name,
-                "has_negative_candidates": True,
                 "candidate_articles": [
                     self._candidate_article_to_dict(article)
-                    for article in prescreened.candidate_articles
+                    for article in adapted_articles
                 ],
             }, None
 
@@ -723,13 +723,17 @@ class StockSelectionSubagentOrchestrator:
         }
 
     @staticmethod
-    def _candidate_article_to_dict(article: CandidateArticle) -> dict[str, Any]:
+    def _candidate_article_to_dict(article: CandidateArticle | Any) -> dict[str, Any]:
         return {
-            "date": article.date,
+            "date": getattr(article, "date", getattr(article, "published_at", "")),
             "title": article.title,
             "summary": article.summary,
             "source": article.source,
-            "candidate_categories": list(article.candidate_categories),
+            **(
+                {"candidate_categories": list(article.candidate_categories)}
+                if hasattr(article, "candidate_categories")
+                else {}
+            ),
         }
 
     def _build_report_summary_task(self, selected_symbols: list[str]) -> str:
