@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -288,3 +289,47 @@ def test_real_news_adapter_filters_out_low_auth_info_level(
     articles = adapter.get_news("600001", 7)
 
     assert [article.title for article in articles] == ["高可信来源"]
+
+
+def test_real_news_adapter_emits_debug_logs_for_request_and_stream_events(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rows = [
+        {
+            "Title": "高可信来源",
+            "Snippet": "摘要B",
+            "PublishTime": "2026-05-30 10:00:00",
+            "SiteName": "站点B",
+            "AuthInfoLevel": 2,
+        }
+    ]
+
+    def fake_stream(method: str, url: str, **kwargs: object) -> _FakeStreamContext:
+        del method, url, kwargs
+        return _FakeStreamContext(
+            _FakeStreamResponse(
+                200,
+                [
+                    _event_payload(rows).encode("utf-8"),
+                    b"data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr("nanobot.stocks.real_news_adapter.httpx.stream", fake_stream)
+
+    adapter = EastmoneySinaNewsAdapter(
+        current_date_provider=lambda: "2026-06-01",
+        debug_logging=True,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="nanobot.stocks.real_news_adapter"):
+        adapter.get_news("001330", 7, name="博纳影业")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("query='博纳影业 001330 新闻'" in message for message in messages)
+    assert any("time_range='OneWeek'" in message for message in messages)
+    assert any("event_index=1" in message for message in messages)
+    assert any("raw_results=1" in message for message in messages)
+    assert any("filtered_results=1" in message for message in messages)

@@ -271,7 +271,7 @@ class AgentLoop:
         )
         self.stock_selection_orchestrator = StockSelectionSubagentOrchestrator(
             executor=self.subagents,
-            news_data=EastmoneySinaNewsAdapter(),
+            news_data=EastmoneySinaNewsAdapter(debug_logging=True),
             technical_data=MCPTechnicalDataAdapter(
                 server_name="mcp-stock-server",
                 tool_registry=self.tools,

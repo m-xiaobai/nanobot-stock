@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import json
+import logging
 import re
 from typing import Callable
 
@@ -15,6 +16,7 @@ from nanobot.stocks.service import NewsArticle, NewsDataAdapter
 _TAG_RE = re.compile(r"<[^>]+>")
 _SEARCH_URL = "https://open.feedcoopapi.com/search_api/web_search"
 _API_KEY = "BfbCJcg4wSObdCMEihGvKovrUjbZNmAF"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,7 +24,8 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
     """Fetch stock-specific news from Feedcoop/Volc web search."""
 
     timeout: float = 15.0
-    result_count: int = 3
+    result_count: int = 5
+    debug_logging: bool = False
     current_date_provider: Callable[[], date | datetime | str] = field(
         default=lambda: date.today()
     )
@@ -66,7 +69,18 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         name: str | None = None,
     ) -> list[dict[str, object]]:
         web_results: list[dict[str, object]] = []
-        query = name+" "+symbol if name else symbol
+        query = f"{name} {symbol}" if name else symbol
+        request_query = f"{query} 新闻"
+        time_range = self._time_range_for_lookback(lookback_days)
+        if self.debug_logging:
+            logger.debug(
+                "feedcoop news request symbol=%s name=%r query=%r time_range=%r count=%s",
+                symbol,
+                name,
+                request_query,
+                time_range,
+                self.result_count,
+            )
         with httpx.stream(
             "POST",
             _SEARCH_URL,
@@ -75,7 +89,7 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
                 "Authorization": f"Bearer {_API_KEY}",
             },
             json={
-                "Query": f"{query} 新闻",
+                "Query": request_query,
                 "SearchType": "web_summary",
                 "Count": self.result_count,
                 "Filter": {
@@ -83,7 +97,7 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
                     "AuthInfoLevel": 2,
                     "NeedUrl": True
                 },
-                "TimeRange": self._time_range_for_lookback(lookback_days),
+                "TimeRange": time_range,
                 "Industry": "finance",
                 
                 "NeedSummary": True
@@ -92,7 +106,7 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         ) as response:
             if response.status_code != 200:
                 raise RuntimeError(f"feedcoop http {response.status_code}: {response.text}")
-            for raw_line in response.iter_lines():
+            for event_index, raw_line in enumerate(response.iter_lines(), start=1):
                 if not raw_line:
                     continue
                 if isinstance(raw_line, bytes):
@@ -114,13 +128,32 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
                 result = event.get("Result") or {}
                 current_results = result.get("WebResults")
                 if isinstance(current_results, list) and current_results:
-                    web_results = [
+                    filtered_results = [
                         row
                         for row in current_results
                         if self._coerce_auth_level(row.get("AuthInfoLevel")) <= 2
                     ]
+                    web_results = filtered_results
+                    if self.debug_logging:
+                        logger.debug(
+                            "feedcoop news event symbol=%s event_index=%s raw_results=%s filtered_results=%s",
+                            symbol,
+                            event_index,
+                            len(current_results),
+                            len(filtered_results),
+                        )
+                elif self.debug_logging:
+                    logger.debug(
+                        "feedcoop news event symbol=%s event_index=%s raw_results=0 filtered_results=0",
+                        symbol,
+                        event_index,
+                    )
         if not web_results:
+            if self.debug_logging:
+                logger.debug("feedcoop news result symbol=%s final_results=0", symbol)
             return []
+        if self.debug_logging:
+            logger.debug("feedcoop news result symbol=%s final_results=%s", symbol, len(web_results))
         return web_results
 
     @staticmethod

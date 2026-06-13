@@ -778,6 +778,36 @@ async def test_orchestrator_prescreens_news_and_escalates_articles_old_excludes_
         ("000001", 3, date(2026, 5, 26), "Beta Bank"),
     ]
 
+
+@pytest.mark.asyncio
+async def test_orchestrator_skips_news_filter_llm_when_no_articles_are_found() -> None:
+    news_data = _FakeNewsAdapter(
+        {
+            "600001": [],
+        }
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=_FakeExecutor(responses=[]),
+        news_data=news_data,
+    )
+
+    review_items, auto_allowed_items = await orchestrator._prepare_news_filter_inputs(
+        [
+            {"symbol": "600001", "name": "Alpha Corp"},
+        ],
+        trade_date=date(2026, 5, 26),
+    )
+
+    assert review_items == []
+    assert auto_allowed_items == [
+        {
+            "symbol": "600001",
+            "name": "Alpha Corp",
+            "allowed": True,
+            "risk_notes": [],
+        }
+    ]
+
 @pytest.mark.asyncio
 async def test_orchestrator_accepts_b2_strategy() -> None:
     executor = _FakeExecutor(

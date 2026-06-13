@@ -618,6 +618,13 @@ class StockSelectionSubagentOrchestrator:
                 }
 
             adapted_articles = adapt_news_articles(raw_articles)
+            if not adapted_articles:
+                return None, {
+                    "symbol": symbol_code,
+                    "name": symbol_name,
+                    "allowed": True,
+                    "risk_notes": [],
+                }
             # prescreened = prescreen_negative_news(symbol_code, adapted_articles)
             # if not prescreened.has_negative_candidates:
             #     return None, {
