@@ -623,7 +623,7 @@ class StockSelectionSubagentOrchestrator:
                     "symbol": symbol_code,
                     "name": symbol_name,
                     "allowed": True,
-                    "risk_notes": [],
+                    "risk_notes": ["no news articles found"],
                 }
             # prescreened = prescreen_negative_news(symbol_code, adapted_articles)
             # if not prescreened.has_negative_candidates:
