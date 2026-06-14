@@ -218,6 +218,50 @@ def test_real_news_adapter_dedupes_and_sorts_newest_first(
     assert articles[0].published_at == "2026-05-29 09:30"
 
 
+def test_real_news_adapter_accumulates_multiple_stream_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_rows = [
+        {
+            "Title": "第一批新闻",
+            "Snippet": "第一批摘要",
+            "PublishTime": "2026-05-29 09:30:00",
+            "SiteName": "站点A",
+            "AuthInfoLevel": 2,
+        }
+    ]
+    second_rows = [
+        {
+            "Title": "第二批新闻",
+            "Snippet": "第二批摘要",
+            "PublishTime": "2026-05-29 10:30:00",
+            "SiteName": "站点B",
+            "AuthInfoLevel": 2,
+        }
+    ]
+
+    def fake_stream(method: str, url: str, **kwargs: object) -> _FakeStreamContext:
+        del method, url, kwargs
+        return _FakeStreamContext(
+            _FakeStreamResponse(
+                200,
+                [
+                    _event_payload(first_rows).encode("utf-8"),
+                    _event_payload(second_rows).encode("utf-8"),
+                    b"data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr("nanobot.stocks.real_news_adapter.httpx.stream", fake_stream)
+
+    adapter = EastmoneySinaNewsAdapter(current_date_provider=lambda: "2026-06-01")
+
+    articles = adapter.get_news("600001", 7)
+
+    assert [article.title for article in articles] == ["第二批新闻", "第一批新闻"]
+
+
 def test_real_news_adapter_preserves_unparseable_publish_time_but_filters_it_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

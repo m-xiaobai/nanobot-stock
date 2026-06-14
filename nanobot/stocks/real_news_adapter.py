@@ -68,7 +68,7 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         *,
         name: str | None = None,
     ) -> list[dict[str, object]]:
-        web_results: list[dict[str, object]] = []
+        collected_rows: list[dict[str, object]] = []
         query = f"{name} {symbol}" if name else symbol
         request_query = f"{query} 新闻"
         time_range = self._time_range_for_lookback(lookback_days)
@@ -128,32 +128,30 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
                 result = event.get("Result") or {}
                 current_results = result.get("WebResults")
                 if isinstance(current_results, list) and current_results:
-                    filtered_results = [
-                        row
-                        for row in current_results
-                        if self._coerce_auth_level(row.get("AuthInfoLevel")) <= 2
-                    ]
-                    web_results = filtered_results
-                    if self.debug_logging:
-                        logger.debug(
-                            "feedcoop news event symbol=%s event_index=%s raw_results=%s filtered_results=%s",
-                            symbol,
-                            event_index,
-                            len(current_results),
-                            len(filtered_results),
-                        )
-                elif self.debug_logging:
-                    logger.debug(
-                        "feedcoop news event symbol=%s event_index=%s raw_results=0 filtered_results=0",
-                        symbol,
-                        event_index,
-                    )
+                    collected_rows.extend(current_results)
+        if not collected_rows:
+            if self.debug_logging:
+                logger.debug("feedcoop news result symbol=%s final_results=0", symbol)
+            return []
+        web_results: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for row in collected_rows:
+            if self._coerce_auth_level(row.get("AuthInfoLevel")) > 2:
+                continue
+            identity = (
+                self._strip_html(str(row.get("Id") or "")),
+                self._strip_html(str(row.get("Title") or "")),
+                self._strip_html(str(row.get("PublishTime") or "")),
+                self._strip_html(str(row.get("SiteName") or "")),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            web_results.append(row)
         if not web_results:
             if self.debug_logging:
                 logger.debug("feedcoop news result symbol=%s final_results=0", symbol)
             return []
-        if self.debug_logging:
-            logger.debug("feedcoop news result symbol=%s final_results=%s", symbol, len(web_results))
         return web_results
 
     @staticmethod
@@ -163,8 +161,7 @@ class EastmoneySinaNewsAdapter(NewsDataAdapter):
         except (TypeError, ValueError):
             return 0
 
-        self,
-    def _filter_by_date(
+    def _filter_by_date(self,
         articles: list[NewsArticle],
         start_date: date,
         end_date: date,
