@@ -71,6 +71,7 @@ class StockSelectionSubagentOrchestrator:
     screening_only: bool = False
     news_filter_only: bool = True
     lookback_days: int = 7
+    news_fetch_max_concurrency: int = 5
     market_scoring_max_concurrency: int = 5
 
     async def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
@@ -593,55 +594,59 @@ class StockSelectionSubagentOrchestrator:
                         "has_negative_candidates": False,
                         "candidate_articles": [],
                     }
-                )
+            )
             return review_items, auto_allowed_items
 
+        concurrency = max(1, self.news_fetch_max_concurrency)
+        gate = asyncio.Semaphore(concurrency)
+
         async def _prepare_one(symbol: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-            symbol_code = str(symbol.get("symbol", ""))
-            symbol_name = str(symbol.get("name", ""))
-            try:
-                raw_articles = await asyncio.to_thread(
-                    self.news_data.get_news,
-                    symbol_code,
-                    self.lookback_days,
-                    trade_date,
-                    symbol_name,
-                )
-            except Exception as exc:
-                display_name = f"{symbol_code} ({symbol_name})" if symbol_name else symbol_code
-                message = f"news data unavailable for {display_name}: {exc}"
-                return None, {
+            async with gate:
+                symbol_code = str(symbol.get("symbol", ""))
+                symbol_name = str(symbol.get("name", ""))
+                try:
+                    raw_articles = await asyncio.to_thread(
+                        self.news_data.get_news,
+                        symbol_code,
+                        self.lookback_days,
+                        trade_date,
+                        symbol_name,
+                    )
+                except Exception as exc:
+                    display_name = f"{symbol_code} ({symbol_name})" if symbol_name else symbol_code
+                    message = f"news data unavailable for {display_name}: {exc}"
+                    return None, {
+                        "symbol": symbol_code,
+                        "name": symbol_name,
+                        "allowed": True,
+                        "risk_notes": [message],
+                    }
+
+                adapted_articles = adapt_news_articles(raw_articles)
+                if not adapted_articles:
+                    return None, {
+                        "symbol": symbol_code,
+                        "name": symbol_name,
+                        "allowed": True,
+                        "risk_notes": ["no news articles found"],
+                    }
+                # prescreened = prescreen_negative_news(symbol_code, adapted_articles)
+                # if not prescreened.has_negative_candidates:
+                #     return None, {
+                #         "symbol": symbol_code,
+                #         "name": symbol_name,
+                #         "allowed": True,
+                #         "risk_notes": [],
+                #     }
+
+                return {
                     "symbol": symbol_code,
                     "name": symbol_name,
-                    "allowed": True,
-                    "risk_notes": [message],
-                }
-
-            adapted_articles = adapt_news_articles(raw_articles)
-            if not adapted_articles:
-                return None, {
-                    "symbol": symbol_code,
-                    "name": symbol_name,
-                    "allowed": True,
-                    "risk_notes": ["no news articles found"],
-                }
-            # prescreened = prescreen_negative_news(symbol_code, adapted_articles)
-            # if not prescreened.has_negative_candidates:
-            #     return None, {
-            #         "symbol": symbol_code,
-            #         "name": symbol_name,
-            #         "allowed": True,
-            #         "risk_notes": [],
-            #     }
-
-            return {
-                "symbol": symbol_code,
-                "name": symbol_name,
-                "candidate_articles": [
-                    self._candidate_article_to_dict(article)
-                    for article in adapted_articles
-                ],
-            }, None
+                    "candidate_articles": [
+                        self._candidate_article_to_dict(article)
+                        for article in adapted_articles
+                    ],
+                }, None
 
         results = await asyncio.gather(*(_prepare_one(symbol) for symbol in symbols))
         for review_item, auto_allowed_item in results:
