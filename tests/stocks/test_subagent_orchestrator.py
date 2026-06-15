@@ -686,9 +686,17 @@ def test_orchestrator_stage_system_prompts_define_hard_constraints() -> None:
     assert "dedicated MCP screening tool" in screening_system
     assert "Completion rule:" in screening_system
 
-    assert "You are a specialized A-share risk news analyst." in news_system
-    assert "If news is unavailable" in news_system
-    assert "only review the supplied candidate articles" in news_system
+    assert "你是一名专门分析 A 股风险新闻的分析师。" in news_system
+    assert "如果提供的新闻上下文不可用、不完整" in news_system
+    assert "不要抓取、假设或依赖候选文章之外的外部新闻" in news_system
+    assert "背景性、持续性或存量风险" in news_system
+    assert "优先保持 `allowed=true`，并尽量给出简短 `risk_notes`" in news_system
+    assert "候选文章记录本身出现在回看窗口内" in news_system
+    assert "不要仅因这篇文章最近出现就判定为近期新增重大负面事件" in news_system
+    assert "评论、情绪分析、财富号/雪球等分析性表述" in news_system
+    assert "不要把作者或平台的总结性判断直接改写为更确定的风险事实" in news_system
+    assert "只用于记录候选文章中已出现、但不足以支持 `allowed=false` 的风险关注点" in news_system
+    assert "如果上下文没有明显需要提示的风险点，可以输出空数组" in news_system
 
     assert "You are a specialized A-share technical scoring analyst." in scoring_system
     assert "technical_score must be an integer from 0 to 100" in scoring_system
@@ -1110,3 +1118,38 @@ async def test_orchestrator_validates_news_filter_item_contract() -> None:
     assert report.partial_failures == [
         "news-filter unavailable for 600001: news-filter item keys mismatch: expected ['allowed', 'name', 'risk_notes', 'symbol'], got ['allowed', 'risk_notes', 'symbol']"
     ]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_public_review_news_candidates_reuses_news_filter_logic() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,"risk_notes":[]}
+            ],"partial_failures":[]}
+            """
+        ]
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(executor=executor, screening_only=False)
+
+    reviewed_items, failures = await orchestrator.review_news_candidates(
+        [
+            {
+                "symbol": "600001",
+                "name": "Alpha Corp",
+                "candidate_articles": [],
+            }
+        ]
+    )
+
+    assert reviewed_items == [
+        {
+            "symbol": "600001",
+            "name": "Alpha Corp",
+            "allowed": True,
+            "risk_notes": [],
+        }
+    ]
+    assert failures == []
+    assert [label for label, _task, _system, _builtin, _mcp, _light in executor.calls] == ["news-filter"]

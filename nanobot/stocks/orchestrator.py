@@ -118,7 +118,7 @@ class StockSelectionSubagentOrchestrator:
                 news_filter_failures: list[str] = []
                 if review_items:
                     with self._langfuse_span("news-filter"):
-                        reviewed_items, news_filter_failures = await self._review_news_candidates(review_items)
+                        reviewed_items, news_filter_failures = await self.review_news_candidates(review_items)
                         self._langfuse_observation_payload(
                             input_payload={
                                 "trade_date": trade_date.isoformat(),
@@ -512,7 +512,7 @@ class StockSelectionSubagentOrchestrator:
         partial_failures = [failure for _scored, failure in results if failure is not None]
         return scored_items, partial_failures
 
-    async def _review_news_candidates(
+    async def review_news_candidates(
         self,
         review_items: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -576,6 +576,12 @@ class StockSelectionSubagentOrchestrator:
             reviewed_items.extend(group_items)
             partial_failures.extend(group_failures)
         return reviewed_items, partial_failures
+
+    async def _review_news_candidates(
+        self,
+        review_items: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        return await self.review_news_candidates(review_items)
 
     async def _prepare_news_filter_inputs(
         self,
