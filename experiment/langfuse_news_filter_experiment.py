@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -129,13 +128,13 @@ def run() -> int:
     langfuse = get_client()
     dataset = langfuse.get_dataset(settings["dataset_name"])
 
-    def news_filter_task(*, item, **_kwargs):
+    async def news_filter_task(*, item, **_kwargs):
         payload = extract_news_filter_payload(item.input)
         original_lookback = orchestrator.lookback_days
         orchestrator.lookback_days = payload["lookback_days"]
         try:
-            reviewed_items, partial_failures = asyncio.run(
-                orchestrator.review_news_candidates(payload["items"])
+            reviewed_items, partial_failures = await orchestrator.review_news_candidates(
+                payload["items"],
             )
         finally:
             orchestrator.lookback_days = original_lookback

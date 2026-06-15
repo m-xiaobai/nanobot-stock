@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
+import types
 
 import pytest
 
@@ -125,3 +128,91 @@ def test_build_settings_rejects_placeholder_dataset(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(RuntimeError, match="DATASET_NAME"):
         langfuse_news_filter_experiment.build_settings()
+
+
+def test_run_uses_async_news_filter_task(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(langfuse_news_filter_experiment, "DATASET_NAME", "news-filter-prod")
+    monkeypatch.setattr(langfuse_news_filter_experiment, "EXPERIMENT_NAME", "exp-1")
+    monkeypatch.setattr(langfuse_news_filter_experiment, "DESCRIPTION", "desc")
+    monkeypatch.setattr(langfuse_news_filter_experiment, "CONFIG_PATH", None)
+    monkeypatch.setattr(langfuse_news_filter_experiment, "MODEL_PRESET", None)
+    monkeypatch.setattr(langfuse_news_filter_experiment, "MODEL_NAME_OVERRIDE", None)
+
+    class _FakeDataset:
+        def run_experiment(self, *, name: str, description: str, task, max_concurrency: int) -> dict[str, int]:
+            assert name == "exp-1"
+            assert description == "desc"
+            assert max_concurrency == langfuse_news_filter_experiment.MAX_CONCURRENCY
+            assert asyncio.iscoroutinefunction(task)
+            payload = asyncio.run(task(item=types.SimpleNamespace(input={"messages": []})))
+            assert json.loads(payload) == {
+                "items": [{"symbol": "600000", "allowed": True, "name": "浦发银行", "risk_notes": []}],
+                "partial_failures": [],
+            }
+            return {"total_items": 1, "success_count": 1, "failure_count": 0}
+
+    class _FakeLangfuseClient:
+        def get_dataset(self, dataset_name: str) -> _FakeDataset:
+            assert dataset_name == "news-filter-prod"
+            return _FakeDataset()
+
+    fake_langfuse_module = types.SimpleNamespace(get_client=lambda: _FakeLangfuseClient())
+    monkeypatch.setitem(sys.modules, "langfuse", fake_langfuse_module)
+
+    monkeypatch.setattr(langfuse_news_filter_experiment, "load_config", lambda _path: types.SimpleNamespace())
+    monkeypatch.setattr(
+        langfuse_news_filter_experiment,
+        "resolve_config_env_vars",
+        lambda _config: types.SimpleNamespace(
+            agents=types.SimpleNamespace(
+                defaults=types.SimpleNamespace(
+                    model_preset=None,
+                    model="test-model",
+                    max_tool_result_chars=2000,
+                    disabled_skills=[],
+                    max_tool_iterations=4,
+                )
+            ),
+            workspace_path=".",
+            tools=types.SimpleNamespace(restrict_to_workspace=True),
+            resolve_preset=lambda: types.SimpleNamespace(model="test-model"),
+        ),
+    )
+    monkeypatch.setattr(langfuse_news_filter_experiment, "make_provider", lambda _config: object())
+    monkeypatch.setattr(langfuse_news_filter_experiment, "MessageBus", lambda: object())
+    monkeypatch.setattr(langfuse_news_filter_experiment, "SubagentManager", lambda **_kwargs: object())
+
+    class _FakeOrchestrator:
+        def __init__(self, executor: object) -> None:
+            del executor
+            self.lookback_days = 7
+
+        async def review_news_candidates(
+            self,
+            review_items: list[dict[str, object]],
+        ) -> tuple[list[dict[str, object]], list[str]]:
+            assert review_items == [{"symbol": "600000", "name": "浦发银行", "candidate_articles": []}]
+            return [{"symbol": "600000", "allowed": True, "name": "浦发银行", "risk_notes": []}], []
+
+    monkeypatch.setattr(
+        langfuse_news_filter_experiment,
+        "StockSelectionSubagentOrchestrator",
+        _FakeOrchestrator,
+    )
+    monkeypatch.setattr(
+        langfuse_news_filter_experiment,
+        "extract_news_filter_payload",
+        lambda _input: {
+            "items": [{"symbol": "600000", "name": "浦发银行", "candidate_articles": []}],
+            "lookback_days": 3,
+        },
+    )
+    monkeypatch.setattr(
+        langfuse_news_filter_experiment,
+        "summarize_experiment_result",
+        lambda **_kwargs: "summary",
+    )
+
+    assert langfuse_news_filter_experiment.run() == 0
+    captured = capsys.readouterr()
+    assert "summary" in captured.out
