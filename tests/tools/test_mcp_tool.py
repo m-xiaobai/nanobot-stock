@@ -45,10 +45,28 @@ def _fake_mcp_module(
     monkeypatch: pytest.MonkeyPatch, fake_mcp_runtime: dict[str, object | None]
 ) -> None:
     mod = ModuleType("mcp")
+
+    class _FakeCallToolResult:
+        pass
+
     mod.types = SimpleNamespace(
         TextContent=_FakeTextContent,
         TextResourceContents=_FakeTextResourceContents,
         BlobResourceContents=_FakeBlobResourceContents,
+        CallToolResult=_FakeCallToolResult,
+        LATEST_PROTOCOL_VERSION="2025-11-25",
+        DEFAULT_NEGOTIATED_VERSION="2025-03-26",
+        Implementation=lambda **kwargs: SimpleNamespace(**kwargs),
+        ClientCapabilities=lambda **kwargs: SimpleNamespace(**kwargs),
+        InitializeRequestParams=lambda **kwargs: SimpleNamespace(**kwargs),
+        InitializeRequest=lambda **kwargs: SimpleNamespace(**kwargs),
+        InitializeResult=lambda **kwargs: SimpleNamespace(**kwargs),
+        ClientRequest=lambda root: SimpleNamespace(root=root),
+        ClientNotification=lambda root: SimpleNamespace(root=root),
+        InitializedNotification=lambda: SimpleNamespace(),
+        TASK_STATUS_COMPLETED="completed",
+        TASK_STATUS_FAILED="failed",
+        TASK_STATUS_CANCELLED="cancelled",
     )
 
     class _FakeStdioServerParameters:
@@ -350,11 +368,65 @@ async def test_execute_handles_generic_exception() -> None:
     assert result == "(MCP tool call failed: RuntimeError)"
 
 
+@pytest.mark.asyncio
+async def test_execute_falls_back_when_server_does_not_advertise_tasks() -> None:
+    async def call_tool(_name: str, arguments: dict) -> object:
+        assert arguments == {"value": 1}
+        return SimpleNamespace(content=[_FakeTextContent("plain result")])
+
+    tool_def = _make_task_tool_def("demo")
+    wrapper = MCPToolWrapper(
+        SimpleNamespace(call_tool=call_tool),
+        "test",
+        tool_def,
+        task_extension_supported=False,
+    )
+
+    result = await wrapper.execute(value=1)
+
+    assert result == "plain result"
+
+
+@pytest.mark.asyncio
+async def test_execute_uses_task_flow_when_supported() -> None:
+    task_session = _make_fake_task_session(
+        status_sequence=[
+            SimpleNamespace(status="working", statusMessage=None, pollInterval=1),
+            SimpleNamespace(status="completed", statusMessage="done", pollInterval=1),
+        ],
+        result_blocks=[_FakeTextContent("task result"), 7],
+    )
+    tool_def = _make_task_tool_def("demo")
+    wrapper = MCPToolWrapper(
+        task_session,
+        "test",
+        tool_def,
+        tool_timeout=0.5,
+        task_extension_supported=True,
+    )
+
+    result = await wrapper.execute(value=1)
+
+    assert result == "task result\n7"
+    assert task_session.calls["call_tool_as_task"] == ("demo", {"value": 1})
+    assert task_session.calls["get_task"] == ["task-1", "task-1"]
+    assert task_session.calls["get_task_result"] == ("task-1", sys.modules["mcp"].types.CallToolResult)
+
+
 def _make_tool_def(name: str) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
         description=f"{name} tool",
         inputSchema={"type": "object", "properties": {}},
+    )
+
+
+def _make_task_tool_def(name: str, task_support: str = "required") -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        description=f"{name} tool",
+        inputSchema={"type": "object", "properties": {}},
+        execution=SimpleNamespace(taskSupport=task_support),
     )
 
 
@@ -366,6 +438,67 @@ def _make_fake_session(tool_names: list[str]) -> SimpleNamespace:
         return SimpleNamespace(tools=[_make_tool_def(name) for name in tool_names])
 
     return SimpleNamespace(initialize=initialize, list_tools=list_tools)
+
+
+def _make_fake_task_session(
+    *,
+    tool_names: list[str] | None = None,
+    status_sequence: list[SimpleNamespace],
+    result_blocks: list[object],
+    server_capabilities: object | None = None,
+) -> SimpleNamespace:
+    calls: dict[str, object] = {}
+    task_index = {"value": 0}
+
+    async def initialize() -> None:
+        return None
+
+    async def send_request(request: object, _result_type: object) -> SimpleNamespace:
+        calls["send_request"] = request
+        return SimpleNamespace(
+            protocolVersion="2025-11-25",
+            capabilities=server_capabilities
+            or SimpleNamespace(extensions={"io.modelcontextprotocol/tasks": {}}),
+            serverInfo=SimpleNamespace(name="fake", version="1"),
+        )
+
+    async def send_notification(notification: object) -> None:
+        calls["send_notification"] = notification
+
+    async def list_tools() -> SimpleNamespace:
+        return SimpleNamespace(tools=[_make_task_tool_def(name) for name in (tool_names or ["demo"])])
+
+    def get_server_capabilities() -> object | None:
+        return server_capabilities
+
+    async def call_tool_as_task(name: str, arguments: dict[str, object]) -> SimpleNamespace:
+        calls["call_tool_as_task"] = (name, arguments)
+        return SimpleNamespace(task=SimpleNamespace(taskId="task-1"))
+
+    async def get_task(task_id: str) -> SimpleNamespace:
+        calls.setdefault("get_task", []).append(task_id)
+        index = min(task_index["value"], len(status_sequence) - 1)
+        task_index["value"] += 1
+        return status_sequence[index]
+
+    async def get_task_result(task_id: str, result_type: object) -> SimpleNamespace:
+        calls["get_task_result"] = (task_id, result_type)
+        return SimpleNamespace(content=result_blocks)
+
+    experimental = SimpleNamespace(
+        call_tool_as_task=call_tool_as_task,
+        get_task=get_task,
+        get_task_result=get_task_result,
+    )
+    return SimpleNamespace(
+        initialize=initialize,
+        send_request=send_request,
+        send_notification=send_notification,
+        list_tools=list_tools,
+        get_server_capabilities=get_server_capabilities,
+        experimental=experimental,
+        calls=calls,
+    )
 
 
 @pytest.mark.asyncio
@@ -414,6 +547,40 @@ async def test_connect_mcp_servers_enabled_tools_supports_wrapped_names(
         await stack.aclose()
 
     assert registry.tool_names == ["mcp_test_demo"]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_enables_task_tools_only_when_server_advertises_extension(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_task_session(
+        tool_names=["demo"],
+        server_capabilities=SimpleNamespace(extensions={"io.modelcontextprotocol/tasks": {}}),
+        status_sequence=[
+            SimpleNamespace(status="working", statusMessage=None, pollInterval=1),
+            SimpleNamespace(status="completed", statusMessage=None, pollInterval=1),
+        ],
+        result_blocks=[_FakeTextContent("task result")],
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=["demo"])},
+        registry,
+    )
+    tool = registry.get("mcp_test_demo")
+    assert tool is not None
+    result = await tool.execute(value=1)
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert result == "task result"
+    assert fake_mcp_runtime["session"].calls["call_tool_as_task"] == ("demo", {"value": 1})
+    init_request = fake_mcp_runtime["session"].calls["send_request"]
+    assert getattr(init_request.root.params, "_meta", None) == {
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": {"io.modelcontextprotocol/tasks": {}}
+        }
+    }
 
 
 @pytest.mark.asyncio

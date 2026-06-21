@@ -36,6 +36,11 @@ _TRANSIENT_EXC_NAMES: frozenset[str] = frozenset((
 ))
 
 _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yarn", "bunx"))
+_TASKS_EXTENSION_ID = "io.modelcontextprotocol/tasks"
+_CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
+_TASK_SUPPORT_OPTIONAL = "optional"
+_TASK_SUPPORT_REQUIRED = "required"
+_TASK_SUPPORT_VALUES = frozenset((_TASK_SUPPORT_OPTIONAL, _TASK_SUPPORT_REQUIRED))
 
 # Characters allowed in tool names by model providers (Anthropic, OpenAI, etc.).
 # Replace anything outside [a-zA-Z0-9_-] with underscore and collapse runs.
@@ -174,18 +179,116 @@ def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
     return normalized
 
 
+def _extract_tool_task_support(tool_def: Any) -> str | None:
+    """Return the tool's task support mode if present."""
+    execution = getattr(tool_def, "execution", None)
+    if execution is None:
+        return None
+    if isinstance(execution, dict):
+        task_support = execution.get("taskSupport")
+    else:
+        task_support = getattr(execution, "taskSupport", None)
+    if isinstance(task_support, str) and task_support in _TASK_SUPPORT_VALUES:
+        return task_support
+    return None
+
+
+def _supports_task_extension(capabilities: Any) -> bool:
+    """Return whether the negotiated server capabilities include Tasks support."""
+    if capabilities is None:
+        return False
+
+    if getattr(capabilities, "tasks", None) is not None:
+        return True
+
+    extensions = getattr(capabilities, "extensions", None)
+    if isinstance(extensions, Mapping) and _TASKS_EXTENSION_ID in extensions:
+        return True
+
+    experimental = getattr(capabilities, "experimental", None)
+    if isinstance(experimental, Mapping) and _TASKS_EXTENSION_ID in experimental:
+        return True
+    return False
+
+
+def _client_task_extensions() -> dict[str, dict[str, Any]]:
+    """Return the client capability extension block for the Tasks extension."""
+    return {"extensions": {_TASKS_EXTENSION_ID: {}}}
+
+
+async def _initialize_mcp_session(session: Any) -> Any:
+    """Initialize an MCP session while advertising the Tasks extension."""
+    from mcp import types
+
+    if not hasattr(session, "send_request") or not hasattr(session, "send_notification"):
+        await session.initialize()
+        return None
+
+    task_handlers = getattr(session, "_task_handlers", None)
+    tasks_capability = task_handlers.build_capability() if task_handlers is not None else None
+    result = await session.send_request(
+        types.ClientRequest(
+            types.InitializeRequest(
+                params=types.InitializeRequestParams(
+                    protocolVersion=types.LATEST_PROTOCOL_VERSION,
+                    capabilities=types.ClientCapabilities(
+                        tasks=tasks_capability,
+                    ),
+                    _meta={_CLIENT_CAPABILITIES_META_KEY: _client_task_extensions()},
+                    clientInfo=getattr(session, "_client_info", types.Implementation(name="mcp", version="0.1.0")),
+                ),
+            )
+        ),
+        types.InitializeResult,
+    )
+
+    supported_versions = {
+        getattr(types, "LATEST_PROTOCOL_VERSION", result.protocolVersion),
+        getattr(types, "DEFAULT_NEGOTIATED_VERSION", result.protocolVersion),
+    }
+    if result.protocolVersion not in supported_versions:
+        raise RuntimeError(f"Unsupported protocol version from the server: {result.protocolVersion}")
+
+    setattr(session, "_server_capabilities", result.capabilities)
+    await session.send_notification(types.ClientNotification(types.InitializedNotification()))
+    return result
+
+
+def _render_text_content(result: Any) -> str:
+    """Render an MCP result content list into plain text."""
+    from mcp import types
+
+    parts: list[str] = []
+    for block in getattr(result, "content", []):
+        if isinstance(block, types.TextContent):
+            parts.append(block.text)
+        else:
+            parts.append(str(block))
+    return "\n".join(parts) or "(no output)"
+
+
 class MCPToolWrapper(Tool):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
     _plugin_discoverable = False
 
-    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        tool_def,
+        tool_timeout: int = 30,
+        *,
+        task_extension_supported: bool = False,
+    ):
         self._session = session
         self._original_name = tool_def.name
         self._name = _sanitize_name(f"mcp_{server_name}_{tool_def.name}")
         self._description = tool_def.description or tool_def.name
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
+        self._task_support = _extract_tool_task_support(tool_def)
+        self._task_extension_supported = task_extension_supported
         self._tool_timeout = tool_timeout
 
     @property
@@ -200,13 +303,61 @@ class MCPToolWrapper(Tool):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
-    async def execute(self, **kwargs: Any) -> str:
+    @property
+    def _supports_tasks(self) -> bool:
+        return self._task_extension_supported and self._task_support in _TASK_SUPPORT_VALUES
+
+    async def _call_tool(self, kwargs: dict[str, Any]) -> str:
+        result = await self._session.call_tool(self._original_name, arguments=kwargs)
+        return _render_text_content(result)
+
+    async def _call_tool_as_task(self, kwargs: dict[str, Any]) -> str:
+        experimental = getattr(self._session, "experimental", None)
+        call_tool_as_task = getattr(experimental, "call_tool_as_task", None)
+        get_task = getattr(experimental, "get_task", None)
+        get_task_result = getattr(experimental, "get_task_result", None)
+        if not callable(call_tool_as_task) or not callable(get_task) or not callable(get_task_result):
+            logger.warning(
+                "MCP tool '{}' supports tasks, but the client session does not expose task APIs; falling back to call_tool()",
+                self._name,
+            )
+            return await self._call_tool(kwargs)
+
         from mcp import types
 
-        for attempt in range(2):  # At most 1 retry
+        create_result = await call_tool_as_task(self._original_name, kwargs)
+        task_id = create_result.task.taskId
+
+        while True:
+            status = await get_task(task_id)
+            task_status = getattr(status, "status", None)
+            if task_status == "input_required":
+                status_message = getattr(status, "statusMessage", None) or "task requires input"
+                logger.warning("MCP task '{}' requires input: {}", self._name, status_message)
+                return f"(MCP task requires input: {status_message})"
+            if task_status == types.TASK_STATUS_COMPLETED:
+                result = await get_task_result(task_id, types.CallToolResult)
+                return _render_text_content(result)
+            if task_status in {types.TASK_STATUS_FAILED, types.TASK_STATUS_CANCELLED}:
+                status_message = getattr(status, "statusMessage", None)
+                if status_message:
+                    return f"(MCP task {task_status}: {status_message})"
+                return f"(MCP task {task_status})"
+
+            interval_ms = getattr(status, "pollInterval", None) or 500
+            await asyncio.sleep(interval_ms / 1000)
+
+    async def _execute_once(self, kwargs: dict[str, Any]) -> str:
+        if self._supports_tasks:
+            return await self._call_tool_as_task(kwargs)
+        return await self._call_tool(kwargs)
+
+    async def execute(self, **kwargs: Any) -> str:
+        attempts = 2 if not self._supports_tasks else 1
+        for attempt in range(attempts):
             try:
                 result = await asyncio.wait_for(
-                    self._session.call_tool(self._original_name, arguments=kwargs),
+                    self._execute_once(kwargs),
                     timeout=self._tool_timeout,
                 )
             except asyncio.TimeoutError:
@@ -224,7 +375,7 @@ class MCPToolWrapper(Tool):
                 return "(MCP tool call was cancelled)"
             except Exception as exc:
                 if _is_transient(exc):
-                    if attempt == 0:
+                    if attempt + 1 < attempts:
                         logger.warning(
                             "MCP tool '{}' hit transient error ({}), retrying once...",
                             self._name,
@@ -232,13 +383,13 @@ class MCPToolWrapper(Tool):
                         )
                         await asyncio.sleep(1)  # Brief backoff before retry
                         continue
-                    # Second transient failure — give up with retry-specific message
+                    # No more retries remain.
                     logger.exception(
-                        "MCP tool '{}' failed after retry: {}",
+                        "MCP tool '{}' failed: {}",
                         self._name,
                         type(exc).__name__,
                     )
-                    return f"(MCP tool call failed after retry: {type(exc).__name__})"
+                    return f"(MCP tool call failed: {type(exc).__name__})"
                 logger.exception(
                     "MCP tool '{}' failed: {}: {}",
                     self._name,
@@ -247,14 +398,7 @@ class MCPToolWrapper(Tool):
                 )
                 return f"(MCP tool call failed: {type(exc).__name__})"
             else:
-                # Success — extract result
-                parts = []
-                for block in result.content:
-                    if isinstance(block, types.TextContent):
-                        parts.append(block.text)
-                    else:
-                        parts.append(str(block))
-                return "\n".join(parts) or "(no output)"
+                return result
 
         return "(MCP tool call failed)"  # Unreachable, but satisfies type checkers
 
@@ -562,7 +706,11 @@ async def connect_mcp_servers(
                 return name, None
 
             session = await server_stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            await _initialize_mcp_session(session)
+            get_server_capabilities = getattr(session, "get_server_capabilities", None)
+            task_extension_supported = _supports_task_extension(
+                get_server_capabilities() if callable(get_server_capabilities) else None
+            )
 
             tools = await session.list_tools()
             enabled_tools = set(cfg.enabled_tools)
@@ -584,7 +732,13 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(
+                    session,
+                    name,
+                    tool_def,
+                    tool_timeout=cfg.tool_timeout,
+                    task_extension_supported=task_extension_supported,
+                )
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1
@@ -766,8 +920,7 @@ async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
     """Reconcile live MCP connections with the current config file."""
     async with _reload_lock(state):
         try:
-            from nanobot.config.loader import (load_config,
-                                               resolve_config_env_vars)
+            from nanobot.config.loader import load_config, resolve_config_env_vars
 
             config = resolve_config_env_vars(load_config())
             next_servers = dict(config.tools.mcp_servers)
