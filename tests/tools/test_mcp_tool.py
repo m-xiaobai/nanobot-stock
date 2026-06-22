@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import nanobot.agent.tools.mcp as mcp_mod
+from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.mcp import (
     MCPPromptWrapper,
     MCPResourceWrapper,
@@ -54,16 +55,22 @@ def _fake_mcp_module(
         TextResourceContents=_FakeTextResourceContents,
         BlobResourceContents=_FakeBlobResourceContents,
         CallToolResult=_FakeCallToolResult,
+        ElicitResult=lambda **kwargs: SimpleNamespace(**kwargs),
+        ErrorData=lambda **kwargs: SimpleNamespace(**kwargs),
         LATEST_PROTOCOL_VERSION="2025-11-25",
         DEFAULT_NEGOTIATED_VERSION="2025-03-26",
         Implementation=lambda **kwargs: SimpleNamespace(**kwargs),
         ClientCapabilities=lambda **kwargs: SimpleNamespace(**kwargs),
+        ElicitationCapability=lambda **kwargs: SimpleNamespace(**kwargs),
+        FormElicitationCapability=lambda **kwargs: SimpleNamespace(**kwargs),
+        UrlElicitationCapability=lambda **kwargs: SimpleNamespace(**kwargs),
         InitializeRequestParams=lambda **kwargs: SimpleNamespace(**kwargs),
         InitializeRequest=lambda **kwargs: SimpleNamespace(**kwargs),
         InitializeResult=lambda **kwargs: SimpleNamespace(**kwargs),
         ClientRequest=lambda root: SimpleNamespace(root=root),
         ClientNotification=lambda root: SimpleNamespace(root=root),
         InitializedNotification=lambda: SimpleNamespace(),
+        INVALID_REQUEST=-32602,
         TASK_STATUS_COMPLETED="completed",
         TASK_STATUS_FAILED="failed",
         TASK_STATUS_CANCELLED="cancelled",
@@ -83,8 +90,11 @@ def _fake_mcp_module(
             self.cwd = cwd
 
     class _FakeClientSession:
-        def __init__(self, _read: object, _write: object) -> None:
+        def __init__(self, _read: object, _write: object, **kwargs: object) -> None:
             self._session = fake_mcp_runtime["session"]
+            if self._session is not None:
+                for key, value in kwargs.items():
+                    setattr(self._session, key, value)
 
         async def __aenter__(self) -> object:
             return self._session
@@ -413,6 +423,154 @@ async def test_execute_uses_task_flow_when_supported() -> None:
     assert task_session.calls["get_task_result"] == ("task-1", sys.modules["mcp"].types.CallToolResult)
 
 
+@pytest.mark.asyncio
+async def test_execute_handles_elicitation_accept_flow() -> None:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    bus = _FakeOutboundBus()
+    state = SimpleNamespace(bus=bus, _pending_queues={"feishu:chat1": queue})
+    callback = mcp_mod.build_elicitation_callback(state)
+    assert callback is not None
+
+    params = SimpleNamespace(
+        mode="form",
+        message="Need your name",
+        requestedSchema={
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        elicitationId="elic-1",
+    )
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        assert arguments == {"value": 1}
+
+        async def _feed_reply() -> None:
+            await asyncio.sleep(0)
+            await queue.put(SimpleNamespace(content='{"name": "Alice"}'))
+
+        feeder = asyncio.create_task(_feed_reply())
+        try:
+            result = await callback(SimpleNamespace(), params)
+        finally:
+            await feeder
+
+        assert result.action == "accept"
+        assert result.content == {"name": "Alice"}
+        return SimpleNamespace(content=[_FakeTextContent(result.content["name"])])
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool), timeout=0.5)
+    wrapper.set_context(
+        RequestContext(
+            channel="feishu",
+            chat_id="chat1",
+            message_id="msg-1",
+            session_key="feishu:chat1",
+            metadata={"thread_id": "thread-1"},
+        )
+    )
+
+    result = await wrapper.execute(value=1)
+
+    assert result == "Alice"
+    assert bus.messages
+    assert getattr(bus.messages[0], "reply_to", None) == "msg-1"
+    assert bus.messages[0].metadata["_mcp_elicitation"]["elicitationId"] == "elic-1"
+    assert "Need your name" in bus.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_execute_handles_elicitation_decline_flow() -> None:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    bus = _FakeOutboundBus()
+    state = SimpleNamespace(bus=bus, _pending_queues={"feishu:chat1": queue})
+    callback = mcp_mod.build_elicitation_callback(state)
+    assert callback is not None
+
+    params = SimpleNamespace(
+        mode="url",
+        message="Open the provided URL",
+        url="https://example.com/continue",
+        elicitationId="elic-2",
+    )
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        assert arguments == {}
+
+        async def _feed_reply() -> None:
+            await asyncio.sleep(0)
+            await queue.put(SimpleNamespace(content="decline"))
+
+        feeder = asyncio.create_task(_feed_reply())
+        try:
+            result = await callback(SimpleNamespace(), params)
+        finally:
+            await feeder
+
+        assert result.action == "decline"
+        return SimpleNamespace(content=[_FakeTextContent(result.action)])
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool), timeout=0.5)
+    wrapper.set_context(
+        RequestContext(
+            channel="feishu",
+            chat_id="chat1",
+            message_id="msg-2",
+            session_key="feishu:chat1",
+            metadata={},
+        )
+    )
+
+    result = await wrapper.execute()
+
+    assert result == "decline"
+    assert bus.messages
+    assert "Open the provided URL" in bus.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_execute_times_out_pending_elicitation(monkeypatch: pytest.MonkeyPatch) -> None:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    bus = _FakeOutboundBus()
+    state = SimpleNamespace(bus=bus, _pending_queues={"feishu:chat1": queue})
+    callback = mcp_mod.build_elicitation_callback(state)
+    assert callback is not None
+    monkeypatch.setattr(mcp_mod, "_ELICITATION_TIMEOUT_SECONDS", 0.01)
+
+    params = SimpleNamespace(
+        mode="form",
+        message="Need input",
+        requestedSchema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        },
+        elicitationId="elic-3",
+    )
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        assert arguments == {}
+        result = await callback(SimpleNamespace(), params)
+        return SimpleNamespace(content=[_FakeTextContent(result.action)])
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool), timeout=0.5)
+    wrapper.set_context(
+        RequestContext(
+            channel="feishu",
+            chat_id="chat1",
+            message_id="msg-3",
+            session_key="feishu:chat1",
+            metadata={},
+        )
+    )
+
+    result = await wrapper.execute()
+
+    assert result == "cancel"
+    assert bus.messages
+    assert "Need input" in bus.messages[0].content
+
+
 def _make_tool_def(name: str) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
@@ -501,6 +659,14 @@ def _make_fake_task_session(
     )
 
 
+class _FakeOutboundBus:
+    def __init__(self) -> None:
+        self.messages: list[object] = []
+
+    async def publish_outbound(self, msg: object) -> None:
+        self.messages.append(msg)
+
+
 @pytest.mark.asyncio
 async def test_connect_mcp_servers_enabled_tools_supports_raw_names(
     fake_mcp_runtime: dict[str, object | None],
@@ -584,6 +750,40 @@ async def test_connect_mcp_servers_enables_task_tools_only_when_server_advertise
 
 
 @pytest.mark.asyncio
+async def test_connect_mcp_servers_advertises_elicitation_capability_when_callback_present(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_task_session(
+        tool_names=["demo"],
+        server_capabilities=SimpleNamespace(extensions={}),
+        status_sequence=[
+            SimpleNamespace(status="working", statusMessage=None, pollInterval=1),
+            SimpleNamespace(status="completed", statusMessage=None, pollInterval=1),
+        ],
+        result_blocks=[_FakeTextContent("task result")],
+    )
+    registry = ToolRegistry()
+    callback = mcp_mod.build_elicitation_callback(
+        SimpleNamespace(bus=_FakeOutboundBus(), _pending_queues={"feishu:chat1": asyncio.Queue()})
+    )
+    assert callback is not None
+
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=["demo"])},
+        registry,
+        elicitation_callback=callback,
+    )
+    tool = registry.get("mcp_test_demo")
+    assert tool is not None
+    for stack in stacks.values():
+        await stack.aclose()
+
+    init_request = fake_mcp_runtime["session"].calls["send_request"]
+    assert getattr(init_request.root.params.capabilities, "elicitation", None) is not None
+    assert fake_mcp_runtime["session"].elicitation_callback is callback
+
+
+@pytest.mark.asyncio
 async def test_connect_mcp_servers_enabled_tools_empty_list_registers_none(
     fake_mcp_runtime: dict[str, object | None],
 ) -> None:
@@ -660,7 +860,7 @@ async def test_connect_mcp_servers_one_failure_does_not_block_others(
     sessions = {"good": _make_fake_session(["demo"])}
 
     class _SelectiveClientSession:
-        def __init__(self, read: object, _write: object) -> None:
+        def __init__(self, read: object, _write: object, **kwargs: object) -> None:
             self._session = sessions[read]
 
         async def __aenter__(self) -> object:

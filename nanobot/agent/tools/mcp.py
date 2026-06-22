@@ -1,24 +1,28 @@
 """MCP client: connects to MCP servers and wraps their tools as native nanobot tools."""
 
 import asyncio
+import json
 import os
 import re
 import shutil
 import urllib.parse
 from contextlib import AsyncExitStack, suppress
-from typing import Any, Mapping
+from contextvars import ContextVar
+from typing import Any, Callable, Mapping
 from weakref import WeakKeyDictionary
 
 import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import (
     INBOUND_META_RUNTIME_CONTROL,
     RUNTIME_CONTROL_ACK,
     RUNTIME_CONTROL_MCP_RELOAD,
     InboundMessage,
+    OutboundMessage,
 )
 
 # Transient connection errors that warrant a single retry.
@@ -41,6 +45,12 @@ _CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 _TASK_SUPPORT_OPTIONAL = "optional"
 _TASK_SUPPORT_REQUIRED = "required"
 _TASK_SUPPORT_VALUES = frozenset((_TASK_SUPPORT_OPTIONAL, _TASK_SUPPORT_REQUIRED))
+_ELICITATION_TIMEOUT_SECONDS = 300.0
+
+_CURRENT_REQUEST_CONTEXT: ContextVar[RequestContext | None] = ContextVar(
+    "mcp_current_request_context",
+    default=None,
+)
 
 # Characters allowed in tool names by model providers (Anthropic, OpenAI, etc.).
 # Replace anything outside [a-zA-Z0-9_-] with underscore and collapse runs.
@@ -216,7 +226,147 @@ def _client_task_extensions() -> dict[str, dict[str, Any]]:
     return {"extensions": {_TASKS_EXTENSION_ID: {}}}
 
 
-async def _initialize_mcp_session(session: Any) -> Any:
+def _format_elicitation_prompt(params: Any) -> str:
+    """Render a human-readable prompt for a server elicitation request."""
+    message = str(getattr(params, "message", "") or "").strip()
+    mode = str(getattr(params, "mode", "") or "").strip()
+
+    parts = ["[MCP Elicitation]"]
+    if message:
+        parts.append(message)
+
+    if mode == "url":
+        url = str(getattr(params, "url", "") or "").strip()
+        if url:
+            parts.append(f"URL: {url}")
+        parts.append("Reply with `confirm` to continue or `cancel` to decline.")
+    else:
+        requested_schema = getattr(params, "requestedSchema", None)
+        if requested_schema:
+            if isinstance(requested_schema, str):
+                schema_text = requested_schema
+            else:
+                schema_text = json.dumps(requested_schema, ensure_ascii=False, indent=2)
+            parts.extend((
+                "Reply with JSON matching this schema:",
+                schema_text,
+            ))
+        parts.append("Reply with `cancel` to decline.")
+
+    return "\n".join(parts)
+
+
+def _parse_elicitation_reply(params: Any, reply_text: str) -> Any:
+    """Convert a user reply into an MCP elicitation result."""
+    from mcp import types
+
+    text = reply_text.strip()
+    lowered = text.lower()
+    if lowered in {"cancel", "cancelled", "canceled", "/cancel"}:
+        return types.ElicitResult(action="cancel")
+    if lowered in {"decline", "declined", "deny", "no", "reject"}:
+        return types.ElicitResult(action="decline")
+
+    mode = str(getattr(params, "mode", "") or "").strip()
+    if mode == "url":
+        if lowered in {"confirm", "confirmed", "yes", "y", "ok", "open", "continue", "accept"}:
+            return types.ElicitResult(action="accept")
+        return types.ElicitResult(action="cancel")
+
+    requested_schema = getattr(params, "requestedSchema", None)
+    properties = {}
+    if isinstance(requested_schema, Mapping):
+        raw_properties = requested_schema.get("properties", {})
+        if isinstance(raw_properties, Mapping):
+            properties = dict(raw_properties)
+
+    if not text:
+        return types.ElicitResult(action="cancel")
+
+    parsed_json: Any = None
+    if text.startswith("{") or text.startswith("["):
+        with suppress(json.JSONDecodeError, TypeError, ValueError):
+            parsed_json = json.loads(text)
+
+    if isinstance(parsed_json, dict):
+        return types.ElicitResult(action="accept", content=parsed_json)
+
+    if len(properties) == 1:
+        key = next(iter(properties))
+        return types.ElicitResult(action="accept", content={key: text})
+
+    return types.ElicitResult(action="cancel")
+
+
+def build_elicitation_callback(state: Any) -> Callable[[Any, Any], Any] | None:
+    """Build an elicitation callback bound to the active agent loop state."""
+    bus = getattr(state, "bus", None)
+    pending_queues = getattr(state, "_pending_queues", None)
+    if bus is None or not isinstance(pending_queues, Mapping):
+        return None
+
+    async def _elicitation_callback(context: Any, params: Any) -> Any:
+        from mcp import types
+
+        request_ctx = _CURRENT_REQUEST_CONTEXT.get()
+        if request_ctx is None or not request_ctx.session_key:
+            return types.ErrorData(
+                code=types.INVALID_REQUEST,
+                message="Elicitation requires an active request context.",
+            )
+
+        queue = pending_queues.get(request_ctx.session_key)
+        if queue is None:
+            return types.ErrorData(
+                code=types.INVALID_REQUEST,
+                message="No pending queue is available for elicitation.",
+            )
+
+        prompt = _format_elicitation_prompt(params)
+        metadata = dict(request_ctx.metadata or {})
+        metadata["_mcp_elicitation"] = {
+            "elicitationId": getattr(params, "elicitationId", None),
+            "mode": getattr(params, "mode", None),
+        }
+        if request_ctx.message_id:
+            metadata.setdefault("message_id", request_ctx.message_id)
+
+        await bus.publish_outbound(
+            OutboundMessage(
+                channel=request_ctx.channel,
+                chat_id=request_ctx.chat_id,
+                content=prompt,
+                reply_to=request_ctx.message_id,
+                metadata=metadata,
+            )
+        )
+
+        try:
+            inbound = await asyncio.wait_for(queue.get(), timeout=_ELICITATION_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP elicitation timed out for session {}",
+                request_ctx.session_key,
+            )
+            return types.ElicitResult(action="cancel")
+
+        reply_text = str(getattr(inbound, "content", "") or "")
+        result = _parse_elicitation_reply(params, reply_text)
+        logger.debug(
+            "MCP elicitation completed for session {} with action {}",
+            request_ctx.session_key,
+            getattr(result, "action", None),
+        )
+        return result
+
+    return _elicitation_callback
+
+
+async def _initialize_mcp_session(
+    session: Any,
+    *,
+    elicitation_supported: bool = False,
+) -> Any:
     """Initialize an MCP session while advertising the Tasks extension."""
     from mcp import types
 
@@ -226,12 +376,19 @@ async def _initialize_mcp_session(session: Any) -> Any:
 
     task_handlers = getattr(session, "_task_handlers", None)
     tasks_capability = task_handlers.build_capability() if task_handlers is not None else None
+    elicitation_capability = None
+    if elicitation_supported:
+        elicitation_capability = types.ElicitationCapability(
+            form=types.FormElicitationCapability(),
+            url=types.UrlElicitationCapability(),
+        )
     result = await session.send_request(
         types.ClientRequest(
             types.InitializeRequest(
                 params=types.InitializeRequestParams(
                     protocolVersion=types.LATEST_PROTOCOL_VERSION,
                     capabilities=types.ClientCapabilities(
+                        elicitation=elicitation_capability,
                         tasks=tasks_capability,
                     ),
                     _meta={_CLIENT_CAPABILITIES_META_KEY: _client_task_extensions()},
@@ -267,7 +424,7 @@ def _render_text_content(result: Any) -> str:
     return "\n".join(parts) or "(no output)"
 
 
-class MCPToolWrapper(Tool):
+class MCPToolWrapper(Tool, ContextAware):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
     _plugin_discoverable = False
@@ -290,6 +447,7 @@ class MCPToolWrapper(Tool):
         self._task_support = _extract_tool_task_support(tool_def)
         self._task_extension_supported = task_extension_supported
         self._tool_timeout = tool_timeout
+        self._request_context: RequestContext | None = None
 
     @property
     def name(self) -> str:
@@ -302,6 +460,9 @@ class MCPToolWrapper(Tool):
     @property
     def parameters(self) -> dict[str, Any]:
         return self._parameters
+
+    def set_context(self, ctx: RequestContext) -> None:
+        self._request_context = ctx
 
     @property
     def _supports_tasks(self) -> bool:
@@ -354,53 +515,58 @@ class MCPToolWrapper(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         attempts = 2 if not self._supports_tasks else 1
-        for attempt in range(attempts):
-            try:
-                result = await asyncio.wait_for(
-                    self._execute_once(kwargs),
-                    timeout=self._tool_timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "MCP tool '{}' timed out after {}s", self._name, self._tool_timeout
-                )
-                return f"(MCP tool call timed out after {self._tool_timeout}s)"
-            except asyncio.CancelledError:
-                # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
-                # Re-raise only if our task was externally cancelled (e.g. /stop).
-                task = asyncio.current_task()
-                if task is not None and task.cancelling() > 0:
-                    raise
-                logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
-                return "(MCP tool call was cancelled)"
-            except Exception as exc:
-                if _is_transient(exc):
-                    if attempt + 1 < attempts:
-                        logger.warning(
-                            "MCP tool '{}' hit transient error ({}), retrying once...",
+        request_ctx = self._request_context
+        token = _CURRENT_REQUEST_CONTEXT.set(request_ctx)
+        try:
+            for attempt in range(attempts):
+                try:
+                    result = await asyncio.wait_for(
+                        self._execute_once(kwargs),
+                        timeout=self._tool_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "MCP tool '{}' timed out after {}s", self._name, self._tool_timeout
+                    )
+                    return f"(MCP tool call timed out after {self._tool_timeout}s)"
+                except asyncio.CancelledError:
+                    # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
+                    # Re-raise only if our task was externally cancelled (e.g. /stop).
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling() > 0:
+                        raise
+                    logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
+                    return "(MCP tool call was cancelled)"
+                except Exception as exc:
+                    if _is_transient(exc):
+                        if attempt + 1 < attempts:
+                            logger.warning(
+                                "MCP tool '{}' hit transient error ({}), retrying once...",
+                                self._name,
+                                type(exc).__name__,
+                            )
+                            await asyncio.sleep(1)  # Brief backoff before retry
+                            continue
+                        # No more retries remain.
+                        logger.exception(
+                            "MCP tool '{}' failed: {}",
                             self._name,
                             type(exc).__name__,
                         )
-                        await asyncio.sleep(1)  # Brief backoff before retry
-                        continue
-                    # No more retries remain.
+                        return f"(MCP tool call failed: {type(exc).__name__})"
                     logger.exception(
-                        "MCP tool '{}' failed: {}",
+                        "MCP tool '{}' failed: {}: {}",
                         self._name,
                         type(exc).__name__,
+                        exc,
                     )
                     return f"(MCP tool call failed: {type(exc).__name__})"
-                logger.exception(
-                    "MCP tool '{}' failed: {}: {}",
-                    self._name,
-                    type(exc).__name__,
-                    exc,
-                )
-                return f"(MCP tool call failed: {type(exc).__name__})"
-            else:
-                return result
+                else:
+                    return result
 
-        return "(MCP tool call failed)"  # Unreachable, but satisfies type checkers
+            return "(MCP tool call failed)"  # Unreachable, but satisfies type checkers
+        finally:
+            _CURRENT_REQUEST_CONTEXT.reset(token)
 
 
 class MCPResourceWrapper(Tool):
@@ -614,7 +780,10 @@ class MCPPromptWrapper(Tool):
 
 
 async def connect_mcp_servers(
-    mcp_servers: dict, registry: ToolRegistry
+    mcp_servers: dict,
+    registry: ToolRegistry,
+    *,
+    elicitation_callback: Callable[[Any, Any], Any] | None = None,
 ) -> dict[str, AsyncExitStack]:
     """Connect to configured MCP servers and register their tools, resources, prompts.
 
@@ -705,8 +874,13 @@ async def connect_mcp_servers(
                 await server_stack.aclose()
                 return name, None
 
-            session = await server_stack.enter_async_context(ClientSession(read, write))
-            await _initialize_mcp_session(session)
+            session = await server_stack.enter_async_context(
+                ClientSession(read, write, elicitation_callback=elicitation_callback)
+            )
+            await _initialize_mcp_session(
+                session,
+                elicitation_supported=elicitation_callback is not None,
+            )
             get_server_capabilities = getattr(session, "get_server_capabilities", None)
             task_extension_supported = _supports_task_extension(
                 get_server_capabilities() if callable(get_server_capabilities) else None
@@ -899,7 +1073,11 @@ async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
         return
     state._mcp_connecting = True
     try:
-        connected = await connect_mcp_servers(missing_servers, registry)
+        connected = await connect_mcp_servers(
+            missing_servers,
+            registry,
+            elicitation_callback=build_elicitation_callback(state),
+        )
         state._mcp_stacks.update(connected)
         state._mcp_connected = bool(state._mcp_stacks)
         if connected:
@@ -959,7 +1137,11 @@ async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
         to_connect = {name: next_servers[name] for name in to_connect_names}
         connected: dict[str, AsyncExitStack] = {}
         if to_connect:
-            connected = await connect_mcp_servers(to_connect, registry)
+            connected = await connect_mcp_servers(
+                to_connect,
+                registry,
+                elicitation_callback=build_elicitation_callback(state),
+            )
             state._mcp_stacks.update(connected)
 
         state._mcp_connected = bool(state._mcp_stacks)
