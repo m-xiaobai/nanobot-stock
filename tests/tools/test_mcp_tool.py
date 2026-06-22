@@ -480,6 +480,51 @@ async def test_execute_handles_elicitation_accept_flow() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_handles_elicitation_from_session_bound_context() -> None:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    bus = _FakeOutboundBus()
+    state = SimpleNamespace(bus=bus, _pending_queues={"feishu:chat1": queue})
+    callback = mcp_mod.build_elicitation_callback(state)
+    assert callback is not None
+
+    params = SimpleNamespace(
+        mode="form",
+        message="Need your name",
+        requestedSchema={
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        elicitationId="elic-1",
+    )
+
+    fake_request_ctx = RequestContext(
+        channel="feishu",
+        chat_id="chat1",
+        message_id="msg-1",
+        session_key="feishu:chat1",
+        metadata={"thread_id": "thread-1"},
+    )
+    fake_session = SimpleNamespace(_nanobot_active_request_context=fake_request_ctx)
+
+    async def _feed_reply() -> None:
+        await asyncio.sleep(0)
+        await queue.put(SimpleNamespace(content='{"name": "Alice"}'))
+
+    feeder = asyncio.create_task(_feed_reply())
+    try:
+        result = await callback(SimpleNamespace(session=fake_session), params)
+    finally:
+        await feeder
+
+    assert result.action == "accept"
+    assert result.content == {"name": "Alice"}
+    assert bus.messages
+    assert getattr(bus.messages[0], "reply_to", None) == "msg-1"
+    assert bus.messages[0].metadata["_mcp_elicitation"]["elicitationId"] == "elic-1"
+
+
+@pytest.mark.asyncio
 async def test_execute_handles_elicitation_decline_flow() -> None:
     queue: asyncio.Queue[object] = asyncio.Queue()
     bus = _FakeOutboundBus()

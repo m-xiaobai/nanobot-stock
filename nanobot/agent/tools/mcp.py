@@ -46,6 +46,7 @@ _TASK_SUPPORT_OPTIONAL = "optional"
 _TASK_SUPPORT_REQUIRED = "required"
 _TASK_SUPPORT_VALUES = frozenset((_TASK_SUPPORT_OPTIONAL, _TASK_SUPPORT_REQUIRED))
 _ELICITATION_TIMEOUT_SECONDS = 300.0
+_ACTIVE_REQUEST_CONTEXT_ATTR = "_nanobot_active_request_context"
 
 _CURRENT_REQUEST_CONTEXT: ContextVar[RequestContext | None] = ContextVar(
     "mcp_current_request_context",
@@ -308,7 +309,9 @@ def build_elicitation_callback(state: Any) -> Callable[[Any, Any], Any] | None:
     async def _elicitation_callback(context: Any, params: Any) -> Any:
         from mcp import types
 
-        request_ctx = _CURRENT_REQUEST_CONTEXT.get()
+        request_ctx = getattr(getattr(context, "session", None), _ACTIVE_REQUEST_CONTEXT_ATTR, None)
+        if request_ctx is None:
+            request_ctx = _CURRENT_REQUEST_CONTEXT.get()
         if request_ctx is None or not request_ctx.session_key:
             return types.ErrorData(
                 code=types.INVALID_REQUEST,
@@ -528,6 +531,8 @@ class MCPToolWrapper(Tool, ContextAware):
         attempts = 2 if not self._supports_tasks else 1
         request_ctx = self._request_context
         token = _CURRENT_REQUEST_CONTEXT.set(request_ctx)
+        previous_request_ctx = getattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR, None)
+        setattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR, request_ctx)
         try:
             for attempt in range(attempts):
                 try:
@@ -577,6 +582,11 @@ class MCPToolWrapper(Tool, ContextAware):
 
             return "(MCP tool call failed)"  # Unreachable, but satisfies type checkers
         finally:
+            if previous_request_ctx is None:
+                with suppress(AttributeError):
+                    delattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR)
+            else:
+                setattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR, previous_request_ctx)
             _CURRENT_REQUEST_CONTEXT.reset(token)
 
 
