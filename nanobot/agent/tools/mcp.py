@@ -232,7 +232,7 @@ def _format_elicitation_prompt(params: Any) -> str:
     message = str(getattr(params, "message", "") or "").strip()
     mode = str(getattr(params, "mode", "") or "").strip()
 
-    parts = ["[MCP Elicitation]"]
+    parts = ["[MCP 确认]"]
     if message:
         parts.append(message)
 
@@ -240,19 +240,12 @@ def _format_elicitation_prompt(params: Any) -> str:
         url = str(getattr(params, "url", "") or "").strip()
         if url:
             parts.append(f"URL: {url}")
-        parts.append("Reply with `confirm` to continue or `cancel` to decline.")
+        parts.append("请回复 `confirm` 继续，或回复 `cancel` 取消。")
     else:
-        requested_schema = getattr(params, "requestedSchema", None)
-        if requested_schema:
-            if isinstance(requested_schema, str):
-                schema_text = requested_schema
-            else:
-                schema_text = json.dumps(requested_schema, ensure_ascii=False, indent=2)
-            parts.extend((
-                "Reply with JSON matching this schema:",
-                schema_text,
-            ))
-        parts.append("Reply with `cancel` to decline.")
+        parts.append("请直接回复 JSON 进行确认。")
+        parts.append("示例：")
+        parts.append(json.dumps({"confirm": True, "reason": "同意执行"}, ensure_ascii=False))
+        parts.append("如果要取消，也可以直接回复 `cancel`。")
 
     return "\n".join(parts)
 
