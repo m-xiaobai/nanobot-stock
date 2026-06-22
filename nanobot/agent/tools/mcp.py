@@ -382,6 +382,11 @@ async def _initialize_mcp_session(
             form=types.FormElicitationCapability(),
             url=types.UrlElicitationCapability(),
         )
+    logger.info(
+        "MCP initialize request: elicitation_supported={} tasks_supported={}",
+        elicitation_capability is not None,
+        tasks_capability is not None,
+    )
     result = await session.send_request(
         types.ClientRequest(
             types.InitializeRequest(
@@ -407,6 +412,12 @@ async def _initialize_mcp_session(
         raise RuntimeError(f"Unsupported protocol version from the server: {result.protocolVersion}")
 
     setattr(session, "_server_capabilities", result.capabilities)
+    logger.info(
+        "MCP initialize response: protocolVersion={} server_elicitation_supported={} server_tasks_supported={}",
+        result.protocolVersion,
+        getattr(result.capabilities, "elicitation", None) is not None,
+        _supports_task_extension(result.capabilities),
+    )
     await session.send_notification(types.ClientNotification(types.InitializedNotification()))
     return result
 
@@ -876,6 +887,12 @@ async def connect_mcp_servers(
 
             session = await server_stack.enter_async_context(
                 ClientSession(read, write, elicitation_callback=elicitation_callback)
+            )
+            logger.info(
+                "MCP server '{}': session created (transport={}, elicitation_callback={})",
+                name,
+                transport_type,
+                elicitation_callback is not None,
             )
             await _initialize_mcp_session(
                 session,
