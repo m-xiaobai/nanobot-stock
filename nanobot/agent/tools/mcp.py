@@ -45,6 +45,8 @@ _CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 _TASK_SUPPORT_OPTIONAL = "optional"
 _TASK_SUPPORT_REQUIRED = "required"
 _TASK_SUPPORT_VALUES = frozenset((_TASK_SUPPORT_OPTIONAL, _TASK_SUPPORT_REQUIRED))
+_TASK_BACKEND_NONE = "none"
+_TASK_BACKEND_STANDARD = "standard"
 _ELICITATION_TIMEOUT_SECONDS = 300.0
 _ACTIVE_REQUEST_CONTEXT_ATTR = "_nanobot_active_request_context"
 
@@ -378,10 +380,13 @@ async def _initialize_mcp_session(
             form=types.FormElicitationCapability(),
             url=types.UrlElicitationCapability(),
         )
+    tasks_extension_advertised = True
+    tasks_typed_capability = tasks_capability is not None
     logger.info(
-        "MCP initialize request: elicitation_supported={} tasks_supported={}",
+        "MCP initialize request: elicitation_supported={} tasks_extension_advertised={} tasks_typed_capability={}",
         elicitation_capability is not None,
-        tasks_capability is not None,
+        tasks_extension_advertised,
+        tasks_typed_capability,
     )
     result = await session.send_request(
         types.ClientRequest(
@@ -430,6 +435,109 @@ def _render_text_content(result: Any) -> str:
             parts.append(str(block))
     return "\n".join(parts) or "(no output)"
 
+def _task_backend_kind_from_result(result: Any, session: Any) -> str:
+    """Return the task backend kind implied by a tool call result."""
+    result_type = getattr(result, "resultType", None)
+    task = getattr(result, "task", None)
+    task_id = getattr(task, "taskId", None)
+    experimental = getattr(session, "experimental", None)
+    has_task_lifecycle = (
+        experimental is not None
+        and callable(getattr(experimental, "get_task_result", None))
+        and (
+            callable(getattr(experimental, "poll_task", None))
+            or callable(getattr(experimental, "get_task", None))
+        )
+    )
+    if result_type == "task" and task_id and has_task_lifecycle:
+        return _TASK_BACKEND_STANDARD
+    return _TASK_BACKEND_NONE
+
+
+def _task_lifecycle_available(session: Any) -> bool:
+    """Return whether the installed SDK exposes task polling/result APIs."""
+    experimental = getattr(session, "experimental", None)
+    return bool(
+        experimental is not None
+        and callable(getattr(experimental, "get_task_result", None))
+        and (
+            callable(getattr(experimental, "poll_task", None))
+            or callable(getattr(experimental, "get_task", None))
+        )
+    )
+
+
+def _task_create_from_result(result: Any) -> str | None:
+    """Extract a task id from a server-directed task result."""
+    if getattr(result, "resultType", None) != "task":
+        return None
+    task = getattr(result, "task", None)
+    task_id = getattr(task, "taskId", None)
+    return str(task_id) if task_id else None
+
+
+async def _task_poll_until_terminal(session: Any, task_id: str, backend_kind: str) -> Any:
+    """Poll task status until a terminal state is reached."""
+    if backend_kind != _TASK_BACKEND_STANDARD:
+        return None
+
+    experimental = getattr(session, "experimental", None)
+    if experimental is None:
+        return None
+    poll_task = getattr(experimental, "poll_task", None)
+    terminal_statuses = {
+        "input_required",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+
+    if callable(poll_task):
+        async for status in poll_task(task_id):
+            if getattr(status, "status", None) in terminal_statuses:
+                setattr(session, "_nanobot_mcp_last_task_status", {task_id: status})
+                return status
+        return None
+
+    get_task = getattr(experimental, "get_task", None)
+    if not callable(get_task):
+        return None
+
+    while True:
+        status = await get_task(task_id)
+        if getattr(status, "status", None) in terminal_statuses:
+            setattr(session, "_nanobot_mcp_last_task_status", {task_id: status})
+            return status
+        interval_ms = (
+            getattr(status, "pollIntervalMs", None)
+            or getattr(status, "pollInterval", None)
+            or 500
+        )
+        await asyncio.sleep(interval_ms / 1000)
+
+
+async def _task_fetch_result(session: Any, task_id: str, backend_kind: str, result_type: Any) -> Any:
+    """Fetch the final task result using the active backend."""
+    if backend_kind != _TASK_BACKEND_STANDARD:
+        return None
+    experimental = getattr(session, "experimental", None)
+    if experimental is None:
+        return None
+    return await experimental.get_task_result(task_id, result_type)
+
+
+async def _task_cancel(session: Any, task_id: str, backend_kind: str) -> None:
+    """Cancel an MCP task if the active backend supports it."""
+    if backend_kind != _TASK_BACKEND_STANDARD:
+        return None
+    experimental = getattr(session, "experimental", None)
+    if experimental is None:
+        return None
+    cancel_task = getattr(experimental, "cancel_task", None)
+    if callable(cancel_task):
+        await cancel_task(task_id)
+    return None
+
 
 class MCPToolWrapper(Tool, ContextAware):
     """Wraps a single MCP server tool as a nanobot Tool."""
@@ -471,57 +579,78 @@ class MCPToolWrapper(Tool, ContextAware):
     def set_context(self, ctx: RequestContext) -> None:
         self._request_context = ctx
 
-    @property
-    def _supports_tasks(self) -> bool:
-        return self._task_extension_supported and self._task_support in _TASK_SUPPORT_VALUES
+    async def _call_tool(self, kwargs: dict[str, Any]) -> Any:
+        return await self._session.call_tool(self._original_name, arguments=kwargs)
 
-    async def _call_tool(self, kwargs: dict[str, Any]) -> str:
-        result = await self._session.call_tool(self._original_name, arguments=kwargs)
-        return _render_text_content(result)
-
-    async def _call_tool_as_task(self, kwargs: dict[str, Any]) -> str:
-        experimental = getattr(self._session, "experimental", None)
-        call_tool_as_task = getattr(experimental, "call_tool_as_task", None)
-        get_task = getattr(experimental, "get_task", None)
-        get_task_result = getattr(experimental, "get_task_result", None)
-        if not callable(call_tool_as_task) or not callable(get_task) or not callable(get_task_result):
+    async def _call_tool_via_task_backend(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        backend_kind: str,
+        create_result: Any,
+    ) -> str:
+        if backend_kind == _TASK_BACKEND_NONE:
             logger.warning(
-                "MCP tool '{}' supports tasks, but the client session does not expose task APIs; falling back to call_tool()",
+                "MCP tool '{}' supports tasks, but no compatible task backend is available; falling back to call_tool()",
                 self._name,
             )
-            return await self._call_tool(kwargs)
+            result = await self._call_tool(kwargs)
+            return _render_text_content(result)
 
         from mcp import types
 
-        create_result = await call_tool_as_task(self._original_name, kwargs)
-        task_id = create_result.task.taskId
+        logger.debug(
+            "MCP task backend selected for tool '{}': backend_kind={} tool_task_support_declared={}",
+            self._name,
+            backend_kind,
+            self._task_support,
+        )
 
-        while True:
-            status = await get_task(task_id)
-            task_status = getattr(status, "status", None)
-            if task_status == "input_required":
-                status_message = getattr(status, "statusMessage", None) or "task requires input"
-                logger.warning("MCP task '{}' requires input: {}", self._name, status_message)
-                return f"(MCP task requires input: {status_message})"
-            if task_status == types.TASK_STATUS_COMPLETED:
-                result = await get_task_result(task_id, types.CallToolResult)
-                return _render_text_content(result)
-            if task_status in {types.TASK_STATUS_FAILED, types.TASK_STATUS_CANCELLED}:
-                status_message = getattr(status, "statusMessage", None)
-                if status_message:
-                    return f"(MCP task {task_status}: {status_message})"
-                return f"(MCP task {task_status})"
+        task_id = _task_create_from_result(create_result)
+        if not task_id:
+            return "(MCP task creation failed: missing task id)"
 
-            interval_ms = getattr(status, "pollInterval", None) or 500
-            await asyncio.sleep(interval_ms / 1000)
+        status = await _task_poll_until_terminal(self._session, task_id, backend_kind)
+        if status is None:
+            return "(MCP task polling failed)"
 
-    async def _execute_once(self, kwargs: dict[str, Any]) -> str:
-        if self._supports_tasks:
-            return await self._call_tool_as_task(kwargs)
-        return await self._call_tool(kwargs)
+        task_status = getattr(status, "status", None)
+        if task_status in {"input_required", types.TASK_STATUS_COMPLETED}:
+            result = await _task_fetch_result(
+                self._session,
+                task_id,
+                backend_kind,
+                types.CallToolResult,
+            )
+            if result is None:
+                return "(MCP task result fetch failed)"
+            return _render_text_content(result)
+        if task_status in {types.TASK_STATUS_FAILED, types.TASK_STATUS_CANCELLED}:
+            status_message = getattr(status, "statusMessage", None)
+            if status_message:
+                return f"(MCP task {task_status}: {status_message})"
+            return f"(MCP task {task_status})"
+        return f"(MCP task {task_status or 'unknown'})"
+
+    async def _call_tool_or_task(self, kwargs: dict[str, Any]) -> str:
+        result = await self._call_tool(kwargs)
+        backend_kind = _task_backend_kind_from_result(result, self._session)
+        if backend_kind == _TASK_BACKEND_STANDARD:
+            logger.debug("MCP tool '{}' call_tool() returned a standard task result", self._name)
+            return await self._call_tool_via_task_backend(
+                kwargs,
+                backend_kind=_TASK_BACKEND_STANDARD,
+                create_result=result,
+            )
+
+        logger.debug(
+            "MCP tool '{}' call_tool() returned a plain result; selected_task_backend=none",
+            self._name,
+        )
+        return _render_text_content(result)
 
     async def execute(self, **kwargs: Any) -> str:
-        attempts = 2 if not self._supports_tasks else 1
+        attempts = 2
         request_ctx = self._request_context
         token = _CURRENT_REQUEST_CONTEXT.set(request_ctx)
         previous_request_ctx = getattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR, None)
@@ -530,7 +659,7 @@ class MCPToolWrapper(Tool, ContextAware):
             for attempt in range(attempts):
                 try:
                     result = await asyncio.wait_for(
-                        self._execute_once(kwargs),
+                        self._call_tool_or_task(kwargs),
                         timeout=self._tool_timeout,
                     )
                 except asyncio.TimeoutError:
@@ -892,10 +1021,11 @@ async def connect_mcp_servers(
                 ClientSession(read, write, elicitation_callback=elicitation_callback)
             )
             logger.info(
-                "MCP server '{}': session created (transport={}, elicitation_callback={})",
+                "MCP server '{}': session created (transport={}, elicitation_callback={}, task_lifecycle_available={})",
                 name,
                 transport_type,
                 elicitation_callback is not None,
+                _task_lifecycle_available(session),
             )
             await _initialize_mcp_session(
                 session,
