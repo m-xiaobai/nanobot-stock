@@ -45,8 +45,10 @@ _CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 _TASK_SUPPORT_OPTIONAL = "optional"
 _TASK_SUPPORT_REQUIRED = "required"
 _TASK_SUPPORT_VALUES = frozenset((_TASK_SUPPORT_OPTIONAL, _TASK_SUPPORT_REQUIRED))
-_TASK_BACKEND_NONE = "none"
-_TASK_BACKEND_STANDARD = "standard"
+_TASK_BACKEND_NONE = "plain"
+_TASK_BACKEND_STANDARD = "server_directed_task"
+_TASK_BACKEND_PROACTIVE = "proactive_task"
+_TASK_DEFAULT_TTL_MS = 60000
 _ELICITATION_TIMEOUT_SECONDS = 300.0
 _ACTIVE_REQUEST_CONTEXT_ATTR = "_nanobot_active_request_context"
 
@@ -467,6 +469,11 @@ def _task_lifecycle_available(session: Any) -> bool:
     )
 
 
+def _task_request_meta() -> dict[str, Any]:
+    """Return per-request client capability metadata for task-aware calls."""
+    return {_CLIENT_CAPABILITIES_META_KEY: _client_task_extensions()}
+
+
 def _task_create_from_result(result: Any) -> str | None:
     """Extract a task id from a server-directed task result."""
     if getattr(result, "resultType", None) != "task":
@@ -478,7 +485,7 @@ def _task_create_from_result(result: Any) -> str | None:
 
 async def _task_poll_until_terminal(session: Any, task_id: str, backend_kind: str) -> Any:
     """Poll task status until a terminal state is reached."""
-    if backend_kind != _TASK_BACKEND_STANDARD:
+    if backend_kind not in {_TASK_BACKEND_STANDARD, _TASK_BACKEND_PROACTIVE}:
         return None
 
     experimental = getattr(session, "experimental", None)
@@ -518,7 +525,7 @@ async def _task_poll_until_terminal(session: Any, task_id: str, backend_kind: st
 
 async def _task_fetch_result(session: Any, task_id: str, backend_kind: str, result_type: Any) -> Any:
     """Fetch the final task result using the active backend."""
-    if backend_kind != _TASK_BACKEND_STANDARD:
+    if backend_kind not in {_TASK_BACKEND_STANDARD, _TASK_BACKEND_PROACTIVE}:
         return None
     experimental = getattr(session, "experimental", None)
     if experimental is None:
@@ -528,7 +535,7 @@ async def _task_fetch_result(session: Any, task_id: str, backend_kind: str, resu
 
 async def _task_cancel(session: Any, task_id: str, backend_kind: str) -> None:
     """Cancel an MCP task if the active backend supports it."""
-    if backend_kind != _TASK_BACKEND_STANDARD:
+    if backend_kind not in {_TASK_BACKEND_STANDARD, _TASK_BACKEND_PROACTIVE}:
         return None
     experimental = getattr(session, "experimental", None)
     if experimental is None:
@@ -579,12 +586,37 @@ class MCPToolWrapper(Tool, ContextAware):
     def set_context(self, ctx: RequestContext) -> None:
         self._request_context = ctx
 
+    @property
+    def _supports_tasks(self) -> bool:
+        if not (self._task_extension_supported and self._task_support in _TASK_SUPPORT_VALUES):
+            return False
+        experimental = getattr(self._session, "experimental", None)
+        return bool(
+            _task_lifecycle_available(self._session)
+            and experimental is not None
+            and callable(getattr(experimental, "call_tool_as_task", None))
+        )
+
     async def _call_tool(self, kwargs: dict[str, Any]) -> Any:
         return await self._session.call_tool(self._original_name, arguments=kwargs)
 
+    async def _call_tool_as_task(self, kwargs: dict[str, Any]) -> Any | None:
+        experimental = getattr(self._session, "experimental", None)
+        if experimental is None:
+            return None
+        call_tool_as_task = getattr(experimental, "call_tool_as_task", None)
+        if not callable(call_tool_as_task):
+            return None
+        return await call_tool_as_task(
+            self._original_name,
+            kwargs,
+            ttl=_TASK_DEFAULT_TTL_MS,
+            meta=_task_request_meta(),
+        )
+
     async def _call_tool_via_task_backend(
         self,
-        kwargs: dict[str, Any],
+        kwargs: dict[str, Any] | None,
         *,
         backend_kind: str,
         create_result: Any,
@@ -606,8 +638,14 @@ class MCPToolWrapper(Tool, ContextAware):
             self._task_support,
         )
 
-        task_id = _task_create_from_result(create_result)
+        task_id = (
+            _task_create_from_result(create_result)
+            if backend_kind == _TASK_BACKEND_STANDARD
+            else str(getattr(getattr(create_result, "task", None), "taskId", "") or "")
+        )
         if not task_id:
+            if backend_kind == _TASK_BACKEND_PROACTIVE:
+                return "(MCP task lifecycle unavailable)"
             return "(MCP task creation failed: missing task id)"
 
         status = await _task_poll_until_terminal(self._session, task_id, backend_kind)
@@ -633,10 +671,48 @@ class MCPToolWrapper(Tool, ContextAware):
         return f"(MCP task {task_status or 'unknown'})"
 
     async def _call_tool_or_task(self, kwargs: dict[str, Any]) -> str:
+        if self._task_support in _TASK_SUPPORT_VALUES:
+            if not self._task_extension_supported:
+                logger.debug(
+                    "MCP tool '{}' selected_path=plain tool_task_support_declared={} task_lifecycle_available={} server_tasks_supported=False",
+                    self._name,
+                    self._task_support,
+                    _task_lifecycle_available(self._session),
+                )
+                result = await self._call_tool(kwargs)
+                return _render_text_content(result)
+            if not self._supports_tasks:
+                logger.debug(
+                    "MCP tool '{}' selected_path=proactive_task tool_task_support_declared={} task_lifecycle_available=False",
+                    self._name,
+                    self._task_support,
+                )
+                return "(MCP task lifecycle unavailable)"
+
+            logger.debug(
+                "MCP tool '{}' selected_path=proactive_task tool_task_support_declared={} task_lifecycle_available={}",
+                self._name,
+                self._task_support,
+                _task_lifecycle_available(self._session),
+            )
+            create_result = await self._call_tool_as_task(kwargs)
+            if create_result is None:
+                return "(MCP task lifecycle unavailable)"
+            return await self._call_tool_via_task_backend(
+                None,
+                backend_kind=_TASK_BACKEND_PROACTIVE,
+                create_result=create_result,
+            )
+
         result = await self._call_tool(kwargs)
         backend_kind = _task_backend_kind_from_result(result, self._session)
         if backend_kind == _TASK_BACKEND_STANDARD:
-            logger.debug("MCP tool '{}' call_tool() returned a standard task result", self._name)
+            logger.debug(
+                "MCP tool '{}' selected_path=server_directed_task tool_task_support_declared={} task_lifecycle_available={}",
+                self._name,
+                self._task_support,
+                _task_lifecycle_available(self._session),
+            )
             return await self._call_tool_via_task_backend(
                 kwargs,
                 backend_kind=_TASK_BACKEND_STANDARD,
@@ -644,13 +720,15 @@ class MCPToolWrapper(Tool, ContextAware):
             )
 
         logger.debug(
-            "MCP tool '{}' call_tool() returned a plain result; selected_task_backend=none",
+            "MCP tool '{}' selected_path=plain tool_task_support_declared={} task_lifecycle_available={}",
             self._name,
+            self._task_support,
+            _task_lifecycle_available(self._session),
         )
         return _render_text_content(result)
 
     async def execute(self, **kwargs: Any) -> str:
-        attempts = 2
+        attempts = 1 if self._supports_tasks else 2
         request_ctx = self._request_context
         token = _CURRENT_REQUEST_CONTEXT.set(request_ctx)
         previous_request_ctx = getattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR, None)
