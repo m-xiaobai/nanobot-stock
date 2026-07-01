@@ -38,6 +38,10 @@ class ApprovalCoordinator:
     def pending_count(self) -> int:
         return len(self._pending_by_id)
 
+    def get(self, approval_id: str) -> PendingApproval | None:
+        self.expire()
+        return self._pending_by_id.get(approval_id)
+
     def register(self, request: PendingApproval) -> None:
         self.expire()
         existing = self._pending_by_session.get(request.session_key)

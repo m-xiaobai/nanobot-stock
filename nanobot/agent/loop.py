@@ -201,6 +201,7 @@ class AgentLoop:
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
         self.bus = bus
+        setattr(self.bus, "_agent_loop_approvals", self.approvals if hasattr(self, "approvals") else None)
         self.channels_config = channels_config
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
@@ -294,6 +295,7 @@ class AgentLoop:
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         self.approvals = ApprovalCoordinator()
+        setattr(self.bus, "_agent_loop_approvals", self.approvals)
         # Per-session pending queues for mid-turn message injection.
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.

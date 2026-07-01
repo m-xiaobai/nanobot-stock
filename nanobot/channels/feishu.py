@@ -352,6 +352,41 @@ class FeishuChannel(BaseChannel):
         return json.dumps(card, ensure_ascii=False)
 
     @staticmethod
+    def _approval_result_text(action: str) -> str:
+        return "已批准" if action == "approve" else "已拒绝"
+
+    @classmethod
+    def _build_approval_result_card(
+        cls,
+        content: str,
+        action: str,
+        operator_name: str | None = None,
+    ) -> Any:
+        result_text = cls._approval_result_text(action)
+        footer = result_text if not operator_name else f"{result_text} · {operator_name}"
+        response = {
+            "toast": {"type": "success", "content": result_text},
+            "card": {
+                "type": "template",
+                "data": {
+                    "template_id": "",
+                    "template_variable": {},
+                },
+            },
+        }
+        response["card"] = {
+            "type": "raw",
+            "data": {
+                "config": {"wide_screen_mode": True},
+                "elements": [
+                    {"tag": "markdown", "content": content},
+                    {"tag": "note", "elements": [{"tag": "plain_text", "content": footer}]},
+                ],
+            },
+        }
+        return response
+
+    @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
         """Register an event handler only when the SDK supports it."""
         method = getattr(builder, method_name, None)
@@ -1745,15 +1780,32 @@ class FeishuChannel(BaseChannel):
 
     def _on_card_action_sync(self, data: Any) -> Any:
         """Bridge Feishu card button callbacks into the main asyncio loop."""
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_card_action(data), self._loop)
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            CallBackCard,
             CallBackToast,
             P2CardActionTriggerResponse,
         )
 
+        event = getattr(data, "event", None)
+        action_payload = getattr(getattr(event, "action", None), "value", None) or {}
+        approval_id = str(action_payload.get("approval_id") or "").strip()
+        action = str(action_payload.get("action") or "").strip().lower()
+        approvals = getattr(self.bus, "_agent_loop_approvals", None)
+        pending = approvals.get(approval_id) if approvals is not None and approval_id else None
+        content = (
+            f"[MCP 敏感操作确认]\nserver: {pending.server_name}\ntool: {pending.tool_name}\nargs: {pending.arguments_summary}"
+            if pending is not None
+            else "[MCP 敏感操作确认]\n该审批已处理。"
+        )
+        operator = getattr(event, "operator", None)
+        operator_name = getattr(operator, "open_id", None) or getattr(operator, "user_id", None)
+        card_payload = self._build_approval_result_card(content, action if action in {"approve", "decline"} else "decline", operator_name)
+
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._on_card_action(data), self._loop)
         response = P2CardActionTriggerResponse()
-        response.toast = CallBackToast({"type": "success", "content": "已收到审批操作"})
+        response.toast = CallBackToast(card_payload["toast"])
+        response.card = CallBackCard(card_payload["card"])
         return response
 
     async def _on_card_action(self, data: Any) -> None:
