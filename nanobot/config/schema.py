@@ -271,6 +271,11 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
+    approval_mode: Literal["inherit", "always_allow", "require_approval", "always_deny"] = "inherit"
+    tool_approvals: dict[
+        str,
+        Literal["inherit", "always_allow", "require_approval", "always_deny"],
+    ] = Field(default_factory=dict)
 
 
 def _lazy_default(module_path: str, class_name: str) -> Any:

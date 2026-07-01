@@ -6,14 +6,16 @@ import os
 import re
 import shutil
 import urllib.parse
+import uuid
 from contextlib import AsyncExitStack, suppress
 from contextvars import ContextVar
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 from weakref import WeakKeyDictionary
 
 import httpx
 from loguru import logger
 
+from nanobot.agent.approval import PendingApproval
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.registry import ToolRegistry
@@ -50,7 +52,9 @@ _TASK_BACKEND_STANDARD = "server_directed_task"
 _TASK_BACKEND_PROACTIVE = "proactive_task"
 _TASK_DEFAULT_TTL_MS = 60000
 _ELICITATION_TIMEOUT_SECONDS = 300.0
+_APPROVAL_TIMEOUT_SECONDS = 300.0
 _ACTIVE_REQUEST_CONTEXT_ATTR = "_nanobot_active_request_context"
+_APPROVAL_MODE_VALUES = frozenset(("inherit", "always_allow", "require_approval", "always_deny"))
 
 _CURRENT_REQUEST_CONTEXT: ContextVar[RequestContext | None] = ContextVar(
     "mcp_current_request_context",
@@ -208,6 +212,72 @@ def _extract_tool_task_support(tool_def: Any) -> str | None:
     return None
 
 
+def _extract_tool_annotations(tool_def: Any) -> dict[str, Any]:
+    """Return a normalized mapping for MCP ToolAnnotations."""
+    annotations = getattr(tool_def, "annotations", None)
+    if annotations is None:
+        return {}
+    if isinstance(annotations, Mapping):
+        return dict(annotations)
+
+    data: dict[str, Any] = {}
+    for key in ("title", "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+        value = getattr(annotations, key, None)
+        if value is not None:
+            data[key] = value
+    return data
+
+
+def _truncate_value(value: str, limit: int = 280) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def _summarize_arguments(arguments: Mapping[str, Any], limit: int = 280) -> str:
+    try:
+        rendered = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        rendered = str(dict(arguments))
+    return _truncate_value(rendered, limit)
+
+
+def _parse_approval_reply(reply_text: str) -> Literal["approve", "decline", "invalid"]:
+    lowered = reply_text.strip().lower()
+    if lowered in {"approve", "approved", "yes", "y", "ok", "confirm", "continue", "/approve"}:
+        return "approve"
+    if lowered in {"decline", "declined", "deny", "reject", "cancel", "no", "n", "/decline", "/cancel"}:
+        return "decline"
+    return "invalid"
+
+
+def _format_approval_prompt(
+    server_name: str,
+    tool_name: str,
+    arguments_summary: str,
+    approval_id: str,
+) -> str:
+    lines = [
+        "[MCP 敏感操作确认]",
+        f"server: {server_name}",
+        f"tool: {tool_name}",
+        f"args: {arguments_summary}",
+        f"请使用按钮确认，或回复 `/approve {approval_id}` 继续，`/decline {approval_id}` 取消。",
+    ]
+    return "\n".join(lines)
+
+
+def _fallback_requires_approval(tool_name: str) -> bool:
+    name = tool_name.strip().lower()
+    if not name:
+        return True
+    if any(token in name for token in ("write", "edit", "update", "create", "delete", "remove", "send", "post", "exec", "run", "deploy", "insert", "upsert")):
+        return True
+    if any(token in name for token in ("read", "list", "get", "search", "fetch")):
+        return False
+    return True
+
+
 def _supports_task_extension(capabilities: Any) -> bool:
     """Return whether the negotiated server capabilities include Tasks support."""
     if capabilities is None:
@@ -360,6 +430,80 @@ def build_elicitation_callback(state: Any) -> Callable[[Any, Any], Any] | None:
         return result
 
     return _elicitation_callback
+
+
+def build_approval_callback(state: Any) -> Callable[[str, str, Mapping[str, Any], RequestContext | None], Any] | None:
+    """Build a host-side approval callback bound to the active agent loop state."""
+    bus = getattr(state, "bus", None)
+    approvals = getattr(state, "approvals", None)
+    if bus is None or approvals is None:
+        return None
+
+    async def _approval_callback(
+        server_name: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        request_ctx: RequestContext | None,
+    ) -> Literal["approve", "decline", "timeout", "unavailable", "already_pending"]:
+        if request_ctx is None or not request_ctx.session_key:
+            return "unavailable"
+
+        approval_id = f"approval-{uuid.uuid4().hex}"
+        arguments_summary = _summarize_arguments(arguments)
+        metadata = dict(request_ctx.metadata or {})
+        metadata["_mcp_approval"] = {
+            "approvalId": approval_id,
+            "serverName": server_name,
+            "toolName": tool_name,
+            "sessionKey": request_ctx.session_key,
+        }
+        prompt = _format_approval_prompt(server_name, tool_name, arguments_summary, approval_id)
+        reply_prompt = (
+            f"仍在等待确认。请使用按钮，或回复 `/approve {approval_id}` 继续，"
+            f"`/decline {approval_id}` 取消。"
+        )
+
+        while True:
+            future: asyncio.Future[InboundMessage] = asyncio.get_running_loop().create_future()
+            pending = PendingApproval(
+                approval_id=approval_id,
+                session_key=request_ctx.session_key,
+                server_name=server_name,
+                tool_name=tool_name,
+                arguments_summary=arguments_summary,
+                request_context=request_ctx,
+                future=future,
+                timeout_s=_APPROVAL_TIMEOUT_SECONDS,
+            )
+            try:
+                approvals.register(pending)
+            except ValueError:
+                future.cancel()
+                return "already_pending"
+
+            try:
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=request_ctx.channel,
+                        chat_id=request_ctx.chat_id,
+                        content=prompt,
+                        reply_to=request_ctx.message_id,
+                        metadata=metadata,
+                    )
+                )
+                try:
+                    inbound = await asyncio.wait_for(future, timeout=_APPROVAL_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    return "timeout"
+
+                decision = _parse_approval_reply(str(getattr(inbound, "content", "") or ""))
+                if decision != "invalid":
+                    return decision
+                prompt = reply_prompt
+            finally:
+                approvals.cancel(approval_id)
+
+    return _approval_callback
 
 
 async def _initialize_mcp_session(
@@ -559,16 +703,30 @@ class MCPToolWrapper(Tool, ContextAware):
         tool_timeout: int = 30,
         *,
         task_extension_supported: bool = False,
+        approval_mode: str = "inherit",
+        tool_approval_modes: Mapping[str, str] | None = None,
+        approval_callback: Callable[[str, str, Mapping[str, Any], RequestContext | None], Any] | None = None,
     ):
         self._session = session
+        self._server_name = server_name
         self._original_name = tool_def.name
         self._name = _sanitize_name(f"mcp_{server_name}_{tool_def.name}")
         self._description = tool_def.description or tool_def.name
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
+        self._annotations = _extract_tool_annotations(tool_def)
         self._task_support = _extract_tool_task_support(tool_def)
         self._task_extension_supported = task_extension_supported
         self._tool_timeout = tool_timeout
+        self._approval_mode = (
+            approval_mode if approval_mode in _APPROVAL_MODE_VALUES else "inherit"
+        )
+        self._tool_approval_modes = {
+            str(key): value
+            for key, value in dict(tool_approval_modes or {}).items()
+            if isinstance(value, str) and value in _APPROVAL_MODE_VALUES
+        }
+        self._approval_callback = approval_callback
         self._request_context: RequestContext | None = None
 
     @property
@@ -582,6 +740,14 @@ class MCPToolWrapper(Tool, ContextAware):
     @property
     def parameters(self) -> dict[str, Any]:
         return self._parameters
+
+    @property
+    def tool_metadata(self) -> dict[str, Any]:
+        return {
+            "server_name": self._server_name,
+            "tool_name": self._original_name,
+            "annotations": dict(self._annotations),
+        }
 
     def set_context(self, ctx: RequestContext) -> None:
         self._request_context = ctx
@@ -727,6 +893,46 @@ class MCPToolWrapper(Tool, ContextAware):
         )
         return _render_text_content(result)
 
+    def _resolved_approval_mode(self) -> str:
+        override = self._tool_approval_modes.get(self._original_name)
+        if override is None:
+            override = self._tool_approval_modes.get(self._name)
+        if override is not None and override != "inherit":
+            return override
+        if self._approval_mode != "inherit":
+            return self._approval_mode
+
+        if self._annotations.get("destructiveHint") is True:
+            return "require_approval"
+        if self._annotations.get("readOnlyHint") is True:
+            return "always_allow"
+        return "require_approval" if _fallback_requires_approval(self._original_name) else "always_allow"
+
+    async def _require_approval(self, kwargs: dict[str, Any]) -> str | None:
+        mode = self._resolved_approval_mode()
+        if mode == "always_allow":
+            return None
+        if mode == "always_deny":
+            return "(MCP tool call denied by local approval policy)"
+        if self._approval_callback is None:
+            return "(MCP tool call approval unavailable)"
+
+        decision = await self._approval_callback(
+            self._server_name,
+            self._original_name,
+            kwargs,
+            self._request_context,
+        )
+        if decision == "approve":
+            return None
+        if decision == "decline":
+            return "(MCP tool call declined by user approval policy)"
+        if decision == "timeout":
+            return "(MCP tool call approval timed out)"
+        if decision == "already_pending":
+            return "(MCP tool approval already pending in this session)"
+        return "(MCP tool call approval unavailable)"
+
     async def execute(self, **kwargs: Any) -> str:
         attempts = 1 if self._supports_tasks else 2
         request_ctx = self._request_context
@@ -734,6 +940,9 @@ class MCPToolWrapper(Tool, ContextAware):
         previous_request_ctx = getattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR, None)
         setattr(self._session, _ACTIVE_REQUEST_CONTEXT_ATTR, request_ctx)
         try:
+            approval_result = await self._require_approval(kwargs)
+            if approval_result is not None:
+                return approval_result
             for attempt in range(attempts):
                 try:
                     result = await asyncio.wait_for(
@@ -1005,6 +1214,7 @@ async def connect_mcp_servers(
     registry: ToolRegistry,
     *,
     elicitation_callback: Callable[[Any, Any], Any] | None = None,
+    approval_callback: Callable[[str, str, Mapping[str, Any], RequestContext | None], Any] | None = None,
 ) -> dict[str, AsyncExitStack]:
     """Connect to configured MCP servers and register their tools, resources, prompts.
 
@@ -1140,6 +1350,9 @@ async def connect_mcp_servers(
                     tool_def,
                     tool_timeout=cfg.tool_timeout,
                     task_extension_supported=task_extension_supported,
+                    approval_mode=getattr(cfg, "approval_mode", "inherit"),
+                    tool_approval_modes=getattr(cfg, "tool_approvals", {}),
+                    approval_callback=approval_callback,
                 )
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
@@ -1304,7 +1517,11 @@ async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
         connected = await connect_mcp_servers(
             missing_servers,
             registry,
-            elicitation_callback=build_elicitation_callback(state),
+            # Elicitation is temporarily disabled in the runtime wiring.
+            # Keep the callback implementation in place for later restoration,
+            # but do not advertise or attach it to active MCP sessions.
+            # elicitation_callback=build_elicitation_callback(state),
+            approval_callback=build_approval_callback(state),
         )
         state._mcp_stacks.update(connected)
         state._mcp_connected = bool(state._mcp_stacks)
@@ -1368,7 +1585,11 @@ async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
             connected = await connect_mcp_servers(
                 to_connect,
                 registry,
-                elicitation_callback=build_elicitation_callback(state),
+                # Elicitation is temporarily disabled in the runtime wiring.
+                # Keep the callback implementation in place for later restoration,
+                # but do not advertise or attach it to active MCP sessions.
+                # elicitation_callback=build_elicitation_callback(state),
+                approval_callback=build_approval_callback(state),
             )
             state._mcp_stacks.update(connected)
 

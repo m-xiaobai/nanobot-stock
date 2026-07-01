@@ -314,6 +314,44 @@ class FeishuChannel(BaseChannel):
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
 
     @staticmethod
+    def _approval_action_value(metadata: dict[str, Any], action: str) -> dict[str, Any]:
+        approval_meta = metadata.get("_mcp_approval", {}) if isinstance(metadata, dict) else {}
+        if not isinstance(approval_meta, dict):
+            approval_meta = {}
+        return {
+            "kind": "mcp_approval",
+            "approval_id": approval_meta.get("approvalId"),
+            "action": action,
+            "session_key": approval_meta.get("sessionKey"),
+        }
+
+    @classmethod
+    def _build_approval_card(cls, content: str, metadata: dict[str, Any]) -> str:
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "markdown", "content": content},
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "type": "primary",
+                            "text": {"tag": "plain_text", "content": "批准"},
+                            "value": cls._approval_action_value(metadata, "approve"),
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "拒绝"},
+                            "value": cls._approval_action_value(metadata, "decline"),
+                        },
+                    ],
+                },
+            ],
+        }
+        return json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
         """Register an event handler only when the SDK supports it."""
         method = getattr(builder, method_name, None)
@@ -355,6 +393,9 @@ class FeishuChannel(BaseChannel):
         )
         builder = self._register_optional_event(
             builder, "register_p2_im_message_reaction_deleted_v1", self._on_reaction_deleted
+        )
+        builder = self._register_optional_event(
+            builder, "register_p2_card_action_trigger", self._on_card_action_sync
         )
         builder = self._register_optional_event(
             builder, "register_p2_im_message_message_read_v1", self._on_message_read
@@ -1524,6 +1565,30 @@ class FeishuChannel(BaseChannel):
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
+            if msg.metadata.get("_mcp_approval"):
+                card = self._build_approval_card(msg.content or "", msg.metadata)
+                reply_msg_id = self._thread_reply_target(msg.metadata)
+                if reply_msg_id:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self._reply_message_sync(
+                            reply_msg_id,
+                            "interactive",
+                            card,
+                            reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
+                        ),
+                    )
+                else:
+                    await loop.run_in_executor(
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        "interactive",
+                        card,
+                    )
+                return
+
             # Handle tool hint messages.  When a streaming card is active for
             # this chat, inline the hint into the card instead of sending a
             # separate message so the user experience stays cohesive.
@@ -1677,6 +1742,61 @@ class FeishuChannel(BaseChannel):
         """
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+
+    def _on_card_action_sync(self, data: Any) -> Any:
+        """Bridge Feishu card button callbacks into the main asyncio loop."""
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._on_card_action(data), self._loop)
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            CallBackToast,
+            P2CardActionTriggerResponse,
+        )
+
+        response = P2CardActionTriggerResponse()
+        response.toast = CallBackToast({"type": "success", "content": "已收到审批操作"})
+        return response
+
+    async def _on_card_action(self, data: Any) -> None:
+        """Handle approval button actions from Feishu interactive cards."""
+        try:
+            event = getattr(data, "event", None)
+            if event is None or getattr(event, "action", None) is None:
+                return
+            value = getattr(event.action, "value", None) or {}
+            if not isinstance(value, dict) or value.get("kind") != "mcp_approval":
+                return
+
+            action = str(value.get("action") or "").strip().lower()
+            approval_id = str(value.get("approval_id") or "").strip()
+            session_key = str(value.get("session_key") or "").strip() or None
+            operator = getattr(event, "operator", None)
+            context = getattr(event, "context", None)
+            sender_id = (
+                getattr(operator, "open_id", None)
+                or getattr(operator, "user_id", None)
+                or "unknown"
+            )
+            chat_id = getattr(context, "open_chat_id", None) or ""
+            if not chat_id or not approval_id or action not in {"approve", "decline"}:
+                return
+
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=action,
+                metadata={
+                    "_mcp_approval": {
+                        "approvalId": approval_id,
+                        "action": action,
+                        "source": "feishu_card_action",
+                    },
+                    "message_id": getattr(context, "open_message_id", None),
+                },
+                session_key=session_key,
+                is_dm=False,
+            )
+        except Exception:
+            self.logger.exception("Error processing Feishu card action")
 
     async def _on_message(self, data: P2ImMessageReceiveV1) -> None:
         """Handle incoming message from Feishu."""

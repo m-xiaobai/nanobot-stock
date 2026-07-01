@@ -216,6 +216,124 @@ def test_wrapper_normalizes_nullable_property_anyof() -> None:
     }
 
 
+def test_wrapper_exposes_annotations_metadata() -> None:
+    tool_def = SimpleNamespace(
+        name="demo",
+        description="demo tool",
+        inputSchema={"type": "object", "properties": {}},
+        annotations=SimpleNamespace(
+            readOnlyHint=False,
+            destructiveHint=True,
+            openWorldHint=False,
+        ),
+    )
+
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "test", tool_def)
+
+    assert wrapper.tool_metadata["server_name"] == "test"
+    assert wrapper.tool_metadata["tool_name"] == "demo"
+    assert wrapper.tool_metadata["annotations"]["destructiveHint"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_requires_approval_before_calling_tool() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def approval_callback(
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, object],
+        request_ctx: RequestContext | None,
+    ) -> str:
+        assert server_name == "test"
+        assert tool_name == "demo"
+        assert arguments == {"value": 1}
+        assert request_ctx is not None
+        return "approve"
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        calls.append((_name, arguments))
+        return SimpleNamespace(content=[_FakeTextContent("approved")])
+
+    tool_def = SimpleNamespace(
+        name="demo",
+        description="demo tool",
+        inputSchema={"type": "object", "properties": {}},
+        annotations=SimpleNamespace(destructiveHint=True),
+    )
+    wrapper = MCPToolWrapper(
+        SimpleNamespace(call_tool=call_tool),
+        "test",
+        tool_def,
+        approval_callback=approval_callback,
+    )
+    wrapper.set_context(
+        RequestContext(channel="feishu", chat_id="chat1", session_key="feishu:chat1"),
+    )
+
+    result = await wrapper.execute(value=1)
+
+    assert result == "approved"
+    assert calls == [("demo", {"value": 1})]
+
+
+@pytest.mark.asyncio
+async def test_execute_decline_skips_remote_call() -> None:
+    async def approval_callback(
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, object],
+        request_ctx: RequestContext | None,
+    ) -> str:
+        return "decline"
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        raise AssertionError("call_tool should not run when approval is declined")
+
+    tool_def = SimpleNamespace(
+        name="demo",
+        description="demo tool",
+        inputSchema={"type": "object", "properties": {}},
+        annotations=SimpleNamespace(destructiveHint=True),
+    )
+    wrapper = MCPToolWrapper(
+        SimpleNamespace(call_tool=call_tool),
+        "test",
+        tool_def,
+        approval_callback=approval_callback,
+    )
+    wrapper.set_context(
+        RequestContext(channel="feishu", chat_id="chat1", session_key="feishu:chat1"),
+    )
+
+    result = await wrapper.execute(value=1)
+
+    assert result == "(MCP tool call declined by user approval policy)"
+
+
+@pytest.mark.asyncio
+async def test_execute_honors_always_deny_override() -> None:
+    async def call_tool(_name: str, arguments: dict) -> object:
+        raise AssertionError("call_tool should not run when approval mode denies")
+
+    tool_def = SimpleNamespace(
+        name="demo",
+        description="demo tool",
+        inputSchema={"type": "object", "properties": {}},
+        annotations=SimpleNamespace(readOnlyHint=True),
+    )
+    wrapper = MCPToolWrapper(
+        SimpleNamespace(call_tool=call_tool),
+        "test",
+        tool_def,
+        approval_mode="always_deny",
+    )
+
+    result = await wrapper.execute(value=1)
+
+    assert result == "(MCP tool call denied by local approval policy)"
+
+
 def test_normalize_windows_stdio_command_is_noop_off_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

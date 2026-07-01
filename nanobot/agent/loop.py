@@ -16,6 +16,7 @@ from loguru import logger
 
 from nanobot.agent import context as agent_context
 from nanobot.agent import model_presets as preset_helpers
+from nanobot.agent.approval import ApprovalCoordinator
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, CompositeHook
@@ -292,6 +293,7 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self.approvals = ApprovalCoordinator()
         # Per-session pending queues for mid-turn message injection.
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
@@ -811,6 +813,12 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
+            if self.approvals.consume(msg):
+                logger.info(
+                    "Consumed MCP approval reply for session {} before normal dispatch",
+                    msg.session_key,
+                )
+                continue
             if await agent_context.handle_runtime_control(self, msg, self.tools):
                 continue
             raw = msg.content.strip()
