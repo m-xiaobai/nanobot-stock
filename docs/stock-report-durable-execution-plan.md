@@ -279,7 +279,6 @@ run 完成后不立即删除持久化数据。最终状态、阶段 artifact 和
 - 恢复时若准备阶段 artifact 已完整，必须直接复用，不能重新请求外部实时数据
 - 恢复时若准备阶段 artifact 缺失，只能按保存的 `trade_date` 重建历史输入
 - 如果某个阶段当前实现无法保证历史数据语义一致，则该 run 不应自动恢复，应标记为 `failed` 或 `stale` 并提示用户重新发起
-- 第一版可以采用保守策略：恢复模式下如果缺少 `prepare-news-filter-inputs` 或 `prepare-market-scoring-inputs` artifact，且没有明确的数据源 capability 证明可按保存的 `trade_date` 重建同一输入，则直接失败，不重新查询最新数据
 
 ## 对现有组件的改动
 

@@ -1229,29 +1229,69 @@ async def test_orchestrator_durable_run_reuses_prepared_input_artifacts() -> Non
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_recovery_refuses_to_rebuild_missing_news_prepare_artifact() -> None:
-    executor = _FakeExecutor(responses=[])
+async def test_orchestrator_recovery_rebuilds_missing_prepare_artifacts_with_trade_date() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,"risk_notes":[]}
+            ],"partial_failures":[]}
+            """,
+            """
+            {"symbol":"600001","technical_score":91,
+             "score_reasons":["trend is above the short and medium moving averages"],
+             "risk_notes":[]}
+            """,
+        ]
+    )
     news_data = _FakeNewsAdapter(
         {
-            "600001": [NewsArticle(title="latest news", published_at="2026-07-02")],
+            "600001": [NewsArticle(title="historical news", published_at="2026-07-01")],
+        }
+    )
+    technical_data = _FakeTechnicalAdapter(
+        {
+            "600001": {
+                "symbol": "600001",
+                "close": 12.36,
+                "data_status": "ok",
+            }
         }
     )
     orchestrator = StockSelectionSubagentOrchestrator(
         executor=executor,
         screening_only=False,
         news_data=news_data,
+        technical_data=technical_data,
     )
 
-    with pytest.raises(DailySelectionServiceError, match="prepare-news-filter-inputs"):
-        await orchestrator.run_stock_report_durable(
-            strategy_name="B1",
-            trade_date=date(2026, 7, 1),
-            artifacts={
-                "stock-screening": {
-                    "screened_items": [{"symbol": "600001", "name": "Alpha Corp"}],
-                },
+    result = await orchestrator.run_stock_report_durable(
+        strategy_name="B1",
+        trade_date=date(2026, 7, 1),
+        artifacts={
+            "stock-screening": {
+                "screened_items": [{"symbol": "600001", "name": "Alpha Corp"}],
             },
-            recovery=True,
-        )
+        },
+        recovery=True,
+    )
 
-    assert news_data.calls == []
+    assert result["prepare-news-filter-inputs"] == {
+        "review_items": [
+            {
+                "symbol": "600001",
+                "name": "Alpha Corp",
+                "candidate_articles": [
+                    {
+                        "title": "historical news",
+                        "summary": "",
+                        "date": "2026-07-01",
+                        "source": "unknown",
+                    }
+                ],
+            },
+        ],
+        "auto_allowed_items": [],
+    }
+    assert news_data.calls == [("600001", 7, date(2026, 7, 1), "Alpha Corp")]
+    assert technical_data.calls == [(["600001"], 60, date(2026, 7, 1))]

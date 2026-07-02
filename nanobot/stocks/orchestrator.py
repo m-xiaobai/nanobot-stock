@@ -114,10 +114,6 @@ class StockSelectionSubagentOrchestrator:
             review_items = list(news_prepare["review_items"])
             auto_allowed_items = list(news_prepare["auto_allowed_items"])
         else:
-            if recovery:
-                raise DailySelectionServiceError(
-                    "cannot recover without persisted prepare-news-filter-inputs artifact"
-                )
             review_items, auto_allowed_items = await self._prepare_news_filter_inputs(
                 screened_items,
                 trade_date=trade_date,
@@ -150,10 +146,6 @@ class StockSelectionSubagentOrchestrator:
         if isinstance(scoring_prepare, dict) and "scoring_items" in scoring_prepare:
             scoring_items = list(scoring_prepare["scoring_items"])
         else:
-            if recovery:
-                raise DailySelectionServiceError(
-                    "cannot recover without persisted prepare-market-scoring-inputs artifact"
-                )
             scoring_items = await self._prepare_market_scoring_inputs(
                 [
                     str(item["symbol"])
