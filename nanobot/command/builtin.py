@@ -14,6 +14,7 @@ from datetime import date
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.stocks.runtime import DateSource
 from nanobot.stocks.service import DailySelectionServiceError
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
@@ -604,20 +605,22 @@ async def cmd_goal(ctx: CommandContext) -> OutboundMessage | None:
     return None
 
 
-def _parse_stock_report_args(raw_args: str) -> tuple[str, date]:
+def _parse_stock_report_args(raw_args: str) -> tuple[str, date, DateSource]:
     parts = raw_args.split()
     if not parts:
         raise DailySelectionServiceError("missing strategy")
     strategy = parts[0]
     trade_date = date.today()
+    date_source = DateSource.IMPLICIT_DEFAULT
     if len(parts) > 1:
         try:
             trade_date = date.fromisoformat(parts[1])
+            date_source = DateSource.EXPLICIT
         except ValueError as exc:
             raise DailySelectionServiceError("date must use YYYY-MM-DD") from exc
     if len(parts) > 2:
         raise DailySelectionServiceError("too many arguments")
-    return strategy, trade_date
+    return strategy, trade_date, date_source
 
 
 def _render_stock_report(report) -> str:
@@ -667,7 +670,32 @@ async def cmd_stock_report(ctx: CommandContext) -> OutboundMessage:
             metadata=metadata,
         )
     try:
-        strategy_name, trade_date = _parse_stock_report_args(ctx.args.strip())
+        strategy_name, trade_date, date_source = _parse_stock_report_args(ctx.args.strip())
+        runtime = getattr(ctx.loop, "stock_report_runtime", None)
+        if runtime is not None:
+            run = runtime.enqueue(
+                strategy_name=strategy_name,
+                trade_date=trade_date,
+                date_source=date_source,
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                session_key=ctx.key,
+            )
+            schedule_run = getattr(runtime, "schedule_run", None)
+            if callable(schedule_run):
+                schedule_run(run.run_id)
+            return OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=(
+                    "Stock report run started.\n"
+                    f"- Run ID: `{run.run_id}`\n"
+                    f"- Strategy: `{strategy_name}`\n"
+                    f"- Trade date: `{trade_date.isoformat()}`\n"
+                    "The report will be delivered to this chat when it completes."
+                ),
+                metadata=metadata,
+            )
         result = runner.run_daily_stock_selection(strategy_name, trade_date)
         report = await result if inspect.isawaitable(result) else result
     except DailySelectionServiceError as exc:

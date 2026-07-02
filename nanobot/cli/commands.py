@@ -722,6 +722,7 @@ def _run_gateway(
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
+    from nanobot.stocks.runtime import StockReportRuntime
 
     port = port if port is not None else config.gateway.port
 
@@ -760,6 +761,12 @@ def _run_gateway(
         ),
         provider_signature=provider_snapshot.signature,
     )
+    stock_report_runtime = StockReportRuntime(
+        workspace=config.workspace_path,
+        runner=agent.stock_selection_orchestrator,
+        bus=bus,
+    )
+    agent.stock_report_runtime = stock_report_runtime
 
     from nanobot.agent.loop import UNIFIED_SESSION_KEY
     from nanobot.bus.events import OutboundMessage
@@ -1068,6 +1075,7 @@ def _run_gateway(
         try:
             await cron.start()
             await heartbeat.start()
+            await stock_report_runtime.start()
             tasks = [
                 agent.run(),
                 channels.start_all(),
@@ -1087,6 +1095,7 @@ def _run_gateway(
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
+            stock_report_runtime.stop()
             agent.stop()
             await channels.stop_all()
             # Flush all cached sessions to durable storage before exit.

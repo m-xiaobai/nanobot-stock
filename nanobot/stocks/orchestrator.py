@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -11,14 +12,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from nanobot.stocks.news_adapter import adapt_news_articles
-from nanobot.stocks.news_rules import CandidateArticle, prescreen_negative_news
+from nanobot.stocks.news_rules import CandidateArticle
 from nanobot.stocks.service import (
     DailySelectionReport,
     DailySelectionServiceError,
-    NewsFilteredStock,
     NewsDataAdapter,
     ScoredStock,
-    ScreeningResult,
     SelectedStockReport,
 )
 from nanobot.utils.prompt_templates import render_template
@@ -74,6 +73,171 @@ class StockSelectionSubagentOrchestrator:
     news_fetch_max_concurrency: int = 5
     market_scoring_max_concurrency: int = 5
 
+    async def run_stock_report_durable(
+        self,
+        *,
+        strategy_name: str,
+        trade_date: date,
+        artifacts: dict[str, Any],
+        checkpoint: Any = None,
+        recovery: bool = False,
+    ) -> dict[str, Any]:
+        """Run the stock report workflow while reusing persisted stage artifacts."""
+        if strategy_name not in _SUPPORTED_STRATEGIES:
+            raise DailySelectionServiceError(f"unknown strategy: {strategy_name}")
+
+        async def save_checkpoint(stage: str) -> None:
+            if checkpoint is None:
+                return
+            result = checkpoint(stage, artifacts[stage])
+            if inspect.isawaitable(result):
+                await result
+
+        screening_artifact = artifacts.get("stock-screening")
+        if isinstance(screening_artifact, dict) and "screened_items" in screening_artifact:
+            screened_items = list(screening_artifact["screened_items"])
+        else:
+            screened = await self._run_json_stage(
+                label="stock-screening",
+                stage="stock-screening",
+                task=self._build_stock_screening_task(strategy_name, trade_date),
+            )
+            screened_items = list(screened["items"])
+            artifacts["stock-screening"] = {"screened_items": screened_items}
+            await save_checkpoint("stock-screening")
+
+        news_prepare = artifacts.get("prepare-news-filter-inputs")
+        if isinstance(news_prepare, dict) and {
+            "review_items",
+            "auto_allowed_items",
+        } <= set(news_prepare):
+            review_items = list(news_prepare["review_items"])
+            auto_allowed_items = list(news_prepare["auto_allowed_items"])
+        else:
+            if recovery:
+                raise DailySelectionServiceError(
+                    "cannot recover without persisted prepare-news-filter-inputs artifact"
+                )
+            review_items, auto_allowed_items = await self._prepare_news_filter_inputs(
+                screened_items,
+                trade_date=trade_date,
+            )
+            artifacts["prepare-news-filter-inputs"] = {
+                "review_items": review_items,
+                "auto_allowed_items": auto_allowed_items,
+            }
+            await save_checkpoint("prepare-news-filter-inputs")
+
+        news_filter = artifacts.get("news-filter")
+        if isinstance(news_filter, dict) and {
+            "reviewed_items",
+            "news_filter_failures",
+        } <= set(news_filter):
+            reviewed_items = list(news_filter["reviewed_items"])
+            news_filter_failures = list(news_filter["news_filter_failures"])
+        else:
+            reviewed_items, news_filter_failures = (
+                await self.review_news_candidates(review_items) if review_items else ([], [])
+            )
+            artifacts["news-filter"] = {
+                "reviewed_items": reviewed_items,
+                "news_filter_failures": news_filter_failures,
+            }
+            await save_checkpoint("news-filter")
+
+        news_items = [*auto_allowed_items, *reviewed_items]
+        scoring_prepare = artifacts.get("prepare-market-scoring-inputs")
+        if isinstance(scoring_prepare, dict) and "scoring_items" in scoring_prepare:
+            scoring_items = list(scoring_prepare["scoring_items"])
+        else:
+            if recovery:
+                raise DailySelectionServiceError(
+                    "cannot recover without persisted prepare-market-scoring-inputs artifact"
+                )
+            scoring_items = await self._prepare_market_scoring_inputs(
+                [
+                    str(item["symbol"])
+                    for item in news_items
+                    if item.get("allowed") and item.get("symbol")
+                ],
+                trade_date=trade_date,
+            )
+            artifacts["prepare-market-scoring-inputs"] = {"scoring_items": scoring_items}
+            await save_checkpoint("prepare-market-scoring-inputs")
+
+        market_scoring = artifacts.get("market-scoring")
+        if isinstance(market_scoring, dict) and {
+            "scored_items",
+            "market_scoring_failures",
+        } <= set(market_scoring):
+            scored_items = list(market_scoring["scored_items"])
+            market_scoring_failures = list(market_scoring["market_scoring_failures"])
+        else:
+            scored_items, market_scoring_failures = await self._score_market_items_individually(
+                scoring_items,
+            )
+            artifacts["market-scoring"] = {
+                "scored_items": scored_items,
+                "market_scoring_failures": market_scoring_failures,
+            }
+            await save_checkpoint("market-scoring")
+
+        merge_artifact = artifacts.get("merge")
+        if isinstance(merge_artifact, dict) and "selected_stocks" in merge_artifact:
+            selected_stocks = [
+                SelectedStockReport(
+                    symbol=str(item["symbol"]),
+                    strategy_name=str(item.get("strategy_name") or strategy_name),
+                    screen_pass_reasons=list(item.get("screen_pass_reasons") or []),
+                    technical_score=int(item.get("technical_score") or 0),
+                    score_reasons=list(item.get("score_reasons") or []),
+                    risk_notes=list(item.get("risk_notes") or []),
+                    report_date=date.fromisoformat(str(item.get("report_date") or trade_date)),
+                )
+                for item in merge_artifact["selected_stocks"]
+            ]
+        else:
+            selected_stocks = self._merge_stage_outputs(
+                strategy_name=strategy_name,
+                trade_date=trade_date,
+                screened=screened_items,
+                news_items=news_items,
+                scoring_items=scored_items,
+            )
+            artifacts["merge"] = {
+                "selected_stocks": [
+                    {
+                        "symbol": item.symbol,
+                        "strategy_name": item.strategy_name,
+                        "screen_pass_reasons": item.screen_pass_reasons,
+                        "technical_score": item.technical_score,
+                        "score_reasons": item.score_reasons,
+                        "risk_notes": item.risk_notes,
+                        "report_date": item.report_date.isoformat(),
+                    }
+                    for item in selected_stocks
+                ],
+                "partial_failures": [*news_filter_failures, *market_scoring_failures],
+            }
+            await save_checkpoint("merge")
+
+        partial_failures = [*news_filter_failures, *market_scoring_failures]
+        report = DailySelectionReport(
+            trade_date=trade_date,
+            strategy_name=strategy_name,
+            market=self.market,
+            selected_stocks=selected_stocks,
+            summary=f"市场评分已完成，共选出 {len(selected_stocks)} 只股票。",
+            global_risk_disclaimer="仅供研究参考，不构成任何投资建议。",
+            partial_failures=partial_failures,
+        )
+        artifacts["finalize"] = {
+            "report_json": self._report_to_json(report),
+            "rendered_report_text": self._render_report_text(report),
+        }
+        await save_checkpoint("finalize")
+        return artifacts
+
     async def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
         if strategy_name not in _SUPPORTED_STRATEGIES:
             raise DailySelectionServiceError(f"unknown strategy: {strategy_name}")
@@ -94,7 +258,7 @@ class StockSelectionSubagentOrchestrator:
                     stage="stock-screening",
                     task=self._build_stock_screening_task(strategy_name, trade_date),
                 )
-                
+
                 # news filtering
                 with self._langfuse_span("prepare-news-filter-inputs"):
                     review_items, auto_allowed_items = await self._prepare_news_filter_inputs(
@@ -132,7 +296,7 @@ class StockSelectionSubagentOrchestrator:
                             },
                         )
                 news_items = [*auto_allowed_items, *reviewed_items]
-                
+
                 #market scoring
                 with self._langfuse_span("prepare-market-scoring-inputs"):
                     scoring_items = await self._prepare_market_scoring_inputs(
@@ -143,7 +307,7 @@ class StockSelectionSubagentOrchestrator:
                         ],
                         trade_date=trade_date,
                     )
-                
+
                 with self._langfuse_span("market-scoring"):
                     scored_items, market_scoring_failures = await self._score_market_items_individually(
                         scoring_items
@@ -235,6 +399,52 @@ class StockSelectionSubagentOrchestrator:
             f"stock-selection:{market}:{strategy_name}:"
             f"{trade_date.isoformat()}:run-{run_ts}"
         )
+
+    @staticmethod
+    def _report_to_json(report: DailySelectionReport) -> dict[str, Any]:
+        return {
+            "trade_date": report.trade_date.isoformat(),
+            "strategy_name": report.strategy_name,
+            "market": report.market,
+            "selected_stocks": [
+                {
+                    "symbol": item.symbol,
+                    "strategy_name": item.strategy_name,
+                    "screen_pass_reasons": item.screen_pass_reasons,
+                    "technical_score": item.technical_score,
+                    "score_reasons": item.score_reasons,
+                    "risk_notes": item.risk_notes,
+                    "report_date": item.report_date.isoformat(),
+                }
+                for item in report.selected_stocks
+            ],
+            "summary": report.summary,
+            "global_risk_disclaimer": report.global_risk_disclaimer,
+            "partial_failures": report.partial_failures,
+        }
+
+    @staticmethod
+    def _render_report_text(report: DailySelectionReport) -> str:
+        lines = [
+            "## 选股报告",
+            f"- 策略: `{report.strategy_name}`",
+            f"- 交易日: `{report.trade_date.isoformat()}`",
+            f"- 市场: `{report.market}`",
+            "",
+            "### 入选标的",
+        ]
+        if report.selected_stocks:
+            for stock in report.selected_stocks:
+                lines.append(f"- `{stock.symbol}` 分数 `{stock.technical_score}`")
+                lines.append(f"  筛选: {', '.join(stock.screen_pass_reasons) or '无'}")
+                lines.append(f"  评分: {', '.join(stock.score_reasons) or '无'}")
+                if stock.risk_notes:
+                    lines.append(f"  风险: {', '.join(stock.risk_notes)}")
+        else:
+            lines.append("- 无")
+        lines.extend(["", "### 总结", report.summary])
+        lines.extend(["", "### 免责声明", report.global_risk_disclaimer])
+        return "\n".join(lines)
 
     @staticmethod
     def _langfuse_span(name: str):
@@ -687,7 +897,7 @@ class StockSelectionSubagentOrchestrator:
                     for key, value in batch_result.items()
                     if isinstance(key, str) and isinstance(value, dict)
                 }
-            except Exception as exc:
+            except Exception:
                 technical_snapshots = {}
 
         for symbol in symbols:

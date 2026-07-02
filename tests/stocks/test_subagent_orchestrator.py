@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from datetime import date
 from typing import Any
 
@@ -1153,3 +1152,106 @@ async def test_orchestrator_public_review_news_candidates_reuses_news_filter_log
     ]
     assert failures == []
     assert [label for label, _task, _system, _builtin, _mcp, _light in executor.calls] == ["news-filter"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_durable_run_reuses_prepared_input_artifacts() -> None:
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,"risk_notes":[]}
+            ],"partial_failures":[]}
+            """,
+            """
+            {"symbol":"600001","technical_score":91,
+             "score_reasons":["trend is above the short and medium moving averages"],
+             "risk_notes":[]}
+            """,
+        ]
+    )
+    news_data = _FakeNewsAdapter(
+        {
+            "600001": AssertionError("news data should not be called"),
+        }
+    )
+    technical_data = _FakeTechnicalAdapter(
+        {
+            "600001": AssertionError("technical data should not be called"),
+        }
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        news_data=news_data,
+        technical_data=technical_data,
+    )
+    artifacts: dict[str, Any] = {
+        "stock-screening": {
+            "screened_items": [{"symbol": "600001", "name": "Alpha Corp"}],
+        },
+        "prepare-news-filter-inputs": {
+            "review_items": [{"symbol": "600001", "name": "Alpha Corp", "candidate_articles": []}],
+            "auto_allowed_items": [],
+        },
+        "prepare-market-scoring-inputs": {
+            "scoring_items": [
+                {
+                    "symbol": "600001",
+                    "technical_snapshot": {
+                        "symbol": "600001",
+                        "close": 12.36,
+                        "data_status": "ok",
+                    },
+                }
+            ],
+        },
+    }
+    checkpoints: list[str] = []
+
+    async def checkpoint(stage: str, artifact: dict[str, Any]) -> None:
+        del artifact
+        checkpoints.append(stage)
+
+    result = await orchestrator.run_stock_report_durable(
+        strategy_name="B1",
+        trade_date=date(2026, 7, 1),
+        artifacts=artifacts,
+        checkpoint=checkpoint,
+    )
+
+    assert news_data.calls == []
+    assert technical_data.calls == []
+    assert "finalize" in result
+    assert "rendered_report_text" in result["finalize"]
+    assert [label for label, *_rest in executor.calls] == ["news-filter", "market-scoring"]
+    assert checkpoints == ["news-filter", "market-scoring", "merge", "finalize"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_recovery_refuses_to_rebuild_missing_news_prepare_artifact() -> None:
+    executor = _FakeExecutor(responses=[])
+    news_data = _FakeNewsAdapter(
+        {
+            "600001": [NewsArticle(title="latest news", published_at="2026-07-02")],
+        }
+    )
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        news_data=news_data,
+    )
+
+    with pytest.raises(DailySelectionServiceError, match="prepare-news-filter-inputs"):
+        await orchestrator.run_stock_report_durable(
+            strategy_name="B1",
+            trade_date=date(2026, 7, 1),
+            artifacts={
+                "stock-screening": {
+                    "screened_items": [{"symbol": "600001", "name": "Alpha Corp"}],
+                },
+            },
+            recovery=True,
+        )
+
+    assert news_data.calls == []

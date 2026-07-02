@@ -2,19 +2,24 @@ from __future__ import annotations
 
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
 from nanobot.bus.events import InboundMessage
-from nanobot.command.builtin import build_help_text, builtin_command_palette, cmd_stock_report, register_builtin_commands
+from nanobot.command.builtin import (
+    build_help_text,
+    builtin_command_palette,
+    cmd_stock_report,
+    register_builtin_commands,
+)
 from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.stocks.runtime import DateSource
 from nanobot.stocks.service import DailySelectionReport, SelectedStockReport
 
 
-def _ctx(raw: str, args: str = "", *, service=None) -> CommandContext:
+def _ctx(raw: str, args: str = "", *, service=None, runtime=None) -> CommandContext:
     msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content=raw)
-    loop = SimpleNamespace(stock_selection_service=service)
+    loop = SimpleNamespace(stock_selection_service=service, stock_report_runtime=runtime)
     return CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, args=args, loop=loop)
 
 
@@ -38,6 +43,19 @@ class _AsyncFakeService:
         return self.report
 
 
+class _FakeStockReportRuntime:
+    def __init__(self) -> None:
+        self.calls = []
+        self.scheduled: list[str] = []
+
+    def enqueue(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(run_id="run-123")
+
+    def schedule_run(self, run_id: str) -> None:
+        self.scheduled.append(run_id)
+
+
 @pytest.mark.asyncio
 async def test_stock_report_command_shows_usage_without_args() -> None:
     out = await cmd_stock_report(_ctx("/stock-report"))
@@ -50,6 +68,41 @@ async def test_stock_report_command_requires_service_configuration() -> None:
     out = await cmd_stock_report(_ctx("/stock-report B1", args="B1"))
 
     assert "stock selection service is not configured" in out.content
+
+
+@pytest.mark.asyncio
+async def test_stock_report_command_enqueues_durable_run_when_runtime_is_configured() -> None:
+    runtime = _FakeStockReportRuntime()
+    service = _FakeService(
+        DailySelectionReport(
+            trade_date=date(2026, 5, 26),
+            strategy_name="B1",
+            market="A",
+            selected_stocks=[],
+            summary="should not run synchronously",
+            global_risk_disclaimer="For research use only.",
+            partial_failures=[],
+        )
+    )
+
+    out = await cmd_stock_report(
+        _ctx("/stock-report B1 2026-05-26", args="B1 2026-05-26", service=service, runtime=runtime)
+    )
+
+    assert service.calls == []
+    assert runtime.calls == [
+        {
+            "strategy_name": "B1",
+            "trade_date": date(2026, 5, 26),
+            "date_source": DateSource.EXPLICIT,
+            "channel": "cli",
+            "chat_id": "direct",
+            "session_key": "cli:direct",
+        }
+    ]
+    assert runtime.scheduled == ["run-123"]
+    assert "Stock report run started" in out.content
+    assert "run-123" in out.content
 
 
 @pytest.mark.asyncio
