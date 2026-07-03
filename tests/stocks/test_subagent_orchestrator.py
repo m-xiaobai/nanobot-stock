@@ -511,6 +511,78 @@ async def test_orchestrator_records_langfuse_session_and_stage_spans(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_durable_run_records_langfuse_session_and_stage_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FAKE_LANGFUSE_EVENTS.clear()
+    executor = _FakeExecutor(
+        responses=[
+            """
+            {"items":[
+              {"symbol":"600001","name":"Alpha Corp","allowed":true,"risk_notes":[]}
+            ],"partial_failures":[]}
+            """,
+            """
+            {"symbol":"600001","technical_score":91,
+             "score_reasons":["trend is above the short and medium moving averages"],
+             "risk_notes":[]}
+            """,
+        ]
+    )
+    fake_client = _FakeLangfuseClient()
+    monkeypatch.setattr("nanobot.stocks.orchestrator.get_client", lambda: fake_client)
+    monkeypatch.setattr("nanobot.stocks.orchestrator.propagate_attributes", _fake_propagate_attributes)
+
+    orchestrator = StockSelectionSubagentOrchestrator(
+        executor=executor,
+        screening_only=False,
+        technical_data=_FakeTechnicalAdapter(
+            {"600001": {"symbol": "600001", "close": 12.36, "data_status": "ok"}}
+        ),
+    )
+
+    artifacts = {
+        "stock-screening": {
+            "screened_items": [{"symbol": "600001", "name": "Alpha Corp"}],
+        },
+    }
+
+    result = await orchestrator.run_stock_report_durable(
+        strategy_name="B1",
+        trade_date=date(2026, 5, 26),
+        artifacts=artifacts,
+        recovery=False,
+    )
+
+    attribute_events = [payload for kind, payload in fake_client.events if kind == "enter_attributes"]
+    assert attribute_events[0]["session_id"].startswith("stock-selection:A:B1:2026-05-26:run-")
+    assert attribute_events[0]["metadata"] == {
+        "strategy_name": "B1",
+        "trade_date": "2026-05-26",
+        "market": "A",
+    }
+    assert {"session_id": None, "metadata": {"stage": "news-filter"}} in attribute_events
+    assert {"session_id": None, "metadata": {"stage": "market-scoring"}} in attribute_events
+
+    started_spans = [payload for kind, payload in fake_client.events if kind == "start_span"]
+    assert started_spans == [
+        "run_stock_report_durable",
+        "prepare-news-filter-inputs",
+        "news-filter",
+        "prepare-market-scoring-inputs",
+        "market-scoring",
+        "merge-stage-outputs",
+        "finalize",
+    ]
+    observation_updates = [
+        payload for kind, payload in fake_client.events if kind == "update_current_observation"
+    ]
+    assert observation_updates[0]["input"]["trade_date"] == "2026-05-26"
+    assert observation_updates[-1]["output"]["report_json"]["trade_date"] == "2026-05-26"
+    assert "finalize" in result
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_ignores_langfuse_when_context_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     _FAKE_LANGFUSE_EVENTS.clear()
     executor = _FakeExecutor(

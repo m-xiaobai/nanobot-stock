@@ -92,143 +92,213 @@ class StockSelectionSubagentOrchestrator:
             result = checkpoint(stage, artifacts[stage])
             if inspect.isawaitable(result):
                 await result
+        session_id = self._build_langfuse_session_id(strategy_name, trade_date, self.market)
+        with self._langfuse_span("run_stock_report_durable"):
+            with self._langfuse_attributes(
+                session_id=session_id,
+                metadata={
+                    "strategy_name": strategy_name,
+                    "trade_date": trade_date.isoformat(),
+                    "market": self.market,
+                },
+            ):
+                screening_artifact = artifacts.get("stock-screening")
+                if isinstance(screening_artifact, dict) and "screened_items" in screening_artifact:
+                    screened_items = list(screening_artifact["screened_items"])
+                else:
+                    screened = await self._run_json_stage(
+                        label="stock-screening",
+                        stage="stock-screening",
+                        task=self._build_stock_screening_task(strategy_name, trade_date),
+                    )
+                    screened_items = list(screened["items"])
+                    artifacts["stock-screening"] = {"screened_items": screened_items}
+                    await save_checkpoint("stock-screening")
 
-        screening_artifact = artifacts.get("stock-screening")
-        if isinstance(screening_artifact, dict) and "screened_items" in screening_artifact:
-            screened_items = list(screening_artifact["screened_items"])
-        else:
-            screened = await self._run_json_stage(
-                label="stock-screening",
-                stage="stock-screening",
-                task=self._build_stock_screening_task(strategy_name, trade_date),
-            )
-            screened_items = list(screened["items"])
-            artifacts["stock-screening"] = {"screened_items": screened_items}
-            await save_checkpoint("stock-screening")
-
-        news_prepare = artifacts.get("prepare-news-filter-inputs")
-        if isinstance(news_prepare, dict) and {
-            "review_items",
-            "auto_allowed_items",
-        } <= set(news_prepare):
-            review_items = list(news_prepare["review_items"])
-            auto_allowed_items = list(news_prepare["auto_allowed_items"])
-        else:
-            review_items, auto_allowed_items = await self._prepare_news_filter_inputs(
-                screened_items,
-                trade_date=trade_date,
-            )
-            artifacts["prepare-news-filter-inputs"] = {
-                "review_items": review_items,
-                "auto_allowed_items": auto_allowed_items,
-            }
-            await save_checkpoint("prepare-news-filter-inputs")
-
-        news_filter = artifacts.get("news-filter")
-        if isinstance(news_filter, dict) and {
-            "reviewed_items",
-            "news_filter_failures",
-        } <= set(news_filter):
-            reviewed_items = list(news_filter["reviewed_items"])
-            news_filter_failures = list(news_filter["news_filter_failures"])
-        else:
-            reviewed_items, news_filter_failures = (
-                await self.review_news_candidates(review_items) if review_items else ([], [])
-            )
-            artifacts["news-filter"] = {
-                "reviewed_items": reviewed_items,
-                "news_filter_failures": news_filter_failures,
-            }
-            await save_checkpoint("news-filter")
-
-        news_items = [*auto_allowed_items, *reviewed_items]
-        scoring_prepare = artifacts.get("prepare-market-scoring-inputs")
-        if isinstance(scoring_prepare, dict) and "scoring_items" in scoring_prepare:
-            scoring_items = list(scoring_prepare["scoring_items"])
-        else:
-            scoring_items = await self._prepare_market_scoring_inputs(
-                [
-                    str(item["symbol"])
-                    for item in news_items
-                    if item.get("allowed") and item.get("symbol")
-                ],
-                trade_date=trade_date,
-            )
-            artifacts["prepare-market-scoring-inputs"] = {"scoring_items": scoring_items}
-            await save_checkpoint("prepare-market-scoring-inputs")
-
-        market_scoring = artifacts.get("market-scoring")
-        if isinstance(market_scoring, dict) and {
-            "scored_items",
-            "market_scoring_failures",
-        } <= set(market_scoring):
-            scored_items = list(market_scoring["scored_items"])
-            market_scoring_failures = list(market_scoring["market_scoring_failures"])
-        else:
-            scored_items, market_scoring_failures = await self._score_market_items_individually(
-                scoring_items,
-            )
-            artifacts["market-scoring"] = {
-                "scored_items": scored_items,
-                "market_scoring_failures": market_scoring_failures,
-            }
-            await save_checkpoint("market-scoring")
-
-        merge_artifact = artifacts.get("merge")
-        if isinstance(merge_artifact, dict) and "selected_stocks" in merge_artifact:
-            selected_stocks = [
-                SelectedStockReport(
-                    symbol=str(item["symbol"]),
-                    strategy_name=str(item.get("strategy_name") or strategy_name),
-                    screen_pass_reasons=list(item.get("screen_pass_reasons") or []),
-                    technical_score=int(item.get("technical_score") or 0),
-                    score_reasons=list(item.get("score_reasons") or []),
-                    risk_notes=list(item.get("risk_notes") or []),
-                    report_date=date.fromisoformat(str(item.get("report_date") or trade_date)),
-                )
-                for item in merge_artifact["selected_stocks"]
-            ]
-        else:
-            selected_stocks = self._merge_stage_outputs(
-                strategy_name=strategy_name,
-                trade_date=trade_date,
-                screened=screened_items,
-                news_items=news_items,
-                scoring_items=scored_items,
-            )
-            artifacts["merge"] = {
-                "selected_stocks": [
-                    {
-                        "symbol": item.symbol,
-                        "strategy_name": item.strategy_name,
-                        "screen_pass_reasons": item.screen_pass_reasons,
-                        "technical_score": item.technical_score,
-                        "score_reasons": item.score_reasons,
-                        "risk_notes": item.risk_notes,
-                        "report_date": item.report_date.isoformat(),
+                news_prepare = artifacts.get("prepare-news-filter-inputs")
+                if isinstance(news_prepare, dict) and {
+                    "review_items",
+                    "auto_allowed_items",
+                } <= set(news_prepare):
+                    review_items = list(news_prepare["review_items"])
+                    auto_allowed_items = list(news_prepare["auto_allowed_items"])
+                else:
+                    with self._langfuse_span("prepare-news-filter-inputs"):
+                        review_items, auto_allowed_items = await self._prepare_news_filter_inputs(
+                            screened_items,
+                            trade_date=trade_date,
+                        )
+                        self._langfuse_observation_payload(
+                            input_payload={
+                                "trade_date": trade_date.isoformat(),
+                                "screened_count": len(screened_items),
+                                "screened_items": screened_items,
+                            },
+                            output_payload={
+                                "review_items_count": len(review_items),
+                                "review_items": review_items,
+                                "auto_allowed_items_count": len(auto_allowed_items),
+                                "auto_allowed_items": auto_allowed_items,
+                            },
+                        )
+                    artifacts["prepare-news-filter-inputs"] = {
+                        "review_items": review_items,
+                        "auto_allowed_items": auto_allowed_items,
                     }
-                    for item in selected_stocks
-                ],
-                "partial_failures": [*news_filter_failures, *market_scoring_failures],
-            }
-            await save_checkpoint("merge")
+                    await save_checkpoint("prepare-news-filter-inputs")
 
-        partial_failures = [*news_filter_failures, *market_scoring_failures]
-        report = DailySelectionReport(
-            trade_date=trade_date,
-            strategy_name=strategy_name,
-            market=self.market,
-            selected_stocks=selected_stocks,
-            summary=f"市场评分已完成，共选出 {len(selected_stocks)} 只股票。",
-            global_risk_disclaimer="仅供研究参考，不构成任何投资建议。",
-            partial_failures=partial_failures,
-        )
-        artifacts["finalize"] = {
-            "report_json": self._report_to_json(report),
-            "rendered_report_text": self._render_report_text(report),
-        }
-        await save_checkpoint("finalize")
-        return artifacts
+                news_filter = artifacts.get("news-filter")
+                if isinstance(news_filter, dict) and {
+                    "reviewed_items",
+                    "news_filter_failures",
+                } <= set(news_filter):
+                    reviewed_items = list(news_filter["reviewed_items"])
+                    news_filter_failures = list(news_filter["news_filter_failures"])
+                else:
+                    with self._langfuse_span("news-filter"):
+                        reviewed_items, news_filter_failures = (
+                            await self.review_news_candidates(review_items) if review_items else ([], [])
+                        )
+                        self._langfuse_observation_payload(
+                            input_payload={
+                                "trade_date": trade_date.isoformat(),
+                                "review_items_count": len(review_items),
+                                "review_items": review_items,
+                            },
+                            output_payload={
+                                "reviewed_items_count": len(reviewed_items),
+                                "reviewed_items": reviewed_items,
+                                "news_filter_failures": news_filter_failures,
+                            },
+                        )
+                    artifacts["news-filter"] = {
+                        "reviewed_items": reviewed_items,
+                        "news_filter_failures": news_filter_failures,
+                    }
+                    await save_checkpoint("news-filter")
+
+                news_items = [*auto_allowed_items, *reviewed_items]
+                scoring_prepare = artifacts.get("prepare-market-scoring-inputs")
+                if isinstance(scoring_prepare, dict) and "scoring_items" in scoring_prepare:
+                    scoring_items = list(scoring_prepare["scoring_items"])
+                else:
+                    with self._langfuse_span("prepare-market-scoring-inputs"):
+                        scoring_items = await self._prepare_market_scoring_inputs(
+                            [
+                                str(item["symbol"])
+                                for item in news_items
+                                if item.get("allowed") and item.get("symbol")
+                            ],
+                            trade_date=trade_date,
+                        )
+                    artifacts["prepare-market-scoring-inputs"] = {"scoring_items": scoring_items}
+                    await save_checkpoint("prepare-market-scoring-inputs")
+
+                market_scoring = artifacts.get("market-scoring")
+                if isinstance(market_scoring, dict) and {
+                    "scored_items",
+                    "market_scoring_failures",
+                } <= set(market_scoring):
+                    scored_items = list(market_scoring["scored_items"])
+                    market_scoring_failures = list(market_scoring["market_scoring_failures"])
+                else:
+                    with self._langfuse_span("market-scoring"):
+                        scored_items, market_scoring_failures = await self._score_market_items_individually(
+                            scoring_items,
+                        )
+                    artifacts["market-scoring"] = {
+                        "scored_items": scored_items,
+                        "market_scoring_failures": market_scoring_failures,
+                    }
+                    await save_checkpoint("market-scoring")
+
+                merge_artifact = artifacts.get("merge")
+                if isinstance(merge_artifact, dict) and "selected_stocks" in merge_artifact:
+                    selected_stocks = [
+                        SelectedStockReport(
+                            symbol=str(item["symbol"]),
+                            strategy_name=str(item.get("strategy_name") or strategy_name),
+                            screen_pass_reasons=list(item.get("screen_pass_reasons") or []),
+                            technical_score=int(item.get("technical_score") or 0),
+                            score_reasons=list(item.get("score_reasons") or []),
+                            risk_notes=list(item.get("risk_notes") or []),
+                            report_date=date.fromisoformat(str(item.get("report_date") or trade_date)),
+                        )
+                        for item in merge_artifact["selected_stocks"]
+                    ]
+                else:
+                    with self._langfuse_span("merge-stage-outputs"):
+                        selected_stocks = self._merge_stage_outputs(
+                            strategy_name=strategy_name,
+                            trade_date=trade_date,
+                            screened=screened_items,
+                            news_items=news_items,
+                            scoring_items=scored_items,
+                        )
+                        self._langfuse_observation_payload(
+                            input_payload={
+                                "strategy_name": strategy_name,
+                                "trade_date": trade_date.isoformat(),
+                                "screened_count": len(screened_items),
+                                "news_items_count": len(news_items),
+                                "scoring_items": scored_items,
+                            },
+                            output_payload={
+                                "selected_count": len(selected_stocks),
+                                "selected_stocks": [
+                                    {
+                                        "symbol": item.symbol,
+                                        "technical_score": item.technical_score,
+                                        "score_reasons": item.score_reasons,
+                                        "risk_notes": item.risk_notes,
+                                    }
+                                    for item in selected_stocks
+                                ],
+                            },
+                        )
+                    artifacts["merge"] = {
+                        "selected_stocks": [
+                            {
+                                "symbol": item.symbol,
+                                "strategy_name": item.strategy_name,
+                                "screen_pass_reasons": item.screen_pass_reasons,
+                                "technical_score": item.technical_score,
+                                "score_reasons": item.score_reasons,
+                                "risk_notes": item.risk_notes,
+                                "report_date": item.report_date.isoformat(),
+                            }
+                            for item in selected_stocks
+                        ],
+                        "partial_failures": [*news_filter_failures, *market_scoring_failures],
+                    }
+                    await save_checkpoint("merge")
+
+                partial_failures = [*news_filter_failures, *market_scoring_failures]
+                report = DailySelectionReport(
+                    trade_date=trade_date,
+                    strategy_name=strategy_name,
+                    market=self.market,
+                    selected_stocks=selected_stocks,
+                    summary=f"市场评分已完成，共选出 {len(selected_stocks)} 只股票。",
+                    global_risk_disclaimer="仅供研究参考，不构成任何投资建议。",
+                    partial_failures=partial_failures,
+                )
+                with self._langfuse_span("finalize"):
+                    artifacts["finalize"] = {
+                        "report_json": self._report_to_json(report),
+                        "rendered_report_text": self._render_report_text(report),
+                    }
+                    self._langfuse_observation_payload(
+                        input_payload={
+                            "selected_count": len(selected_stocks),
+                            "partial_failures": partial_failures,
+                        },
+                        output_payload={
+                            "report_json": artifacts["finalize"]["report_json"],
+                        },
+                    )
+                await save_checkpoint("finalize")
+                return artifacts
 
     async def run_daily_stock_selection(self, strategy_name: str, trade_date: date) -> DailySelectionReport:
         if strategy_name not in _SUPPORTED_STRATEGIES:
