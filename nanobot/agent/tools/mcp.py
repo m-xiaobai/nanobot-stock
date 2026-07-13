@@ -50,7 +50,6 @@ _TASK_SUPPORT_VALUES = frozenset((_TASK_SUPPORT_OPTIONAL, _TASK_SUPPORT_REQUIRED
 _TASK_BACKEND_NONE = "plain"
 _TASK_BACKEND_STANDARD = "server_directed_task"
 _TASK_BACKEND_PROACTIVE = "proactive_task"
-_TASK_DEFAULT_TTL_MS = 60000
 _ELICITATION_TIMEOUT_SECONDS = 300.0
 _APPROVAL_TIMEOUT_SECONDS = 300.0
 _ACTIVE_REQUEST_CONTEXT_ATTR = "_nanobot_active_request_context"
@@ -642,9 +641,23 @@ async def _task_poll_until_terminal(session: Any, task_id: str, backend_kind: st
         "failed",
         "cancelled",
     }
+    previous_status: Any = None
+
+    def _log_status_change(status: Any) -> None:
+        nonlocal previous_status
+        current_status = getattr(status, "status", None)
+        if current_status != previous_status:
+            logger.debug(
+                "MCP task status changed: task_id={} backend_kind={} status={}",
+                task_id,
+                backend_kind,
+                current_status,
+            )
+            previous_status = current_status
 
     if callable(poll_task):
         async for status in poll_task(task_id):
+            _log_status_change(status)
             if getattr(status, "status", None) in terminal_statuses:
                 setattr(session, "_nanobot_mcp_last_task_status", {task_id: status})
                 return status
@@ -656,6 +669,7 @@ async def _task_poll_until_terminal(session: Any, task_id: str, backend_kind: st
 
     while True:
         status = await get_task(task_id)
+        _log_status_change(status)
         if getattr(status, "status", None) in terminal_statuses:
             setattr(session, "_nanobot_mcp_last_task_status", {task_id: status})
             return status
@@ -677,17 +691,18 @@ async def _task_fetch_result(session: Any, task_id: str, backend_kind: str, resu
     return await experimental.get_task_result(task_id, result_type)
 
 
-async def _task_cancel(session: Any, task_id: str, backend_kind: str) -> None:
+async def _task_cancel(session: Any, task_id: str, backend_kind: str) -> bool:
     """Cancel an MCP task if the active backend supports it."""
     if backend_kind not in {_TASK_BACKEND_STANDARD, _TASK_BACKEND_PROACTIVE}:
-        return None
+        return False
     experimental = getattr(session, "experimental", None)
     if experimental is None:
-        return None
+        return False
     cancel_task = getattr(experimental, "cancel_task", None)
     if callable(cancel_task):
         await cancel_task(task_id)
-    return None
+        return True
+    return False
 
 
 class MCPToolWrapper(Tool, ContextAware):
@@ -702,6 +717,7 @@ class MCPToolWrapper(Tool, ContextAware):
         tool_def,
         tool_timeout: int = 30,
         *,
+        task_wait_timeout: int = 900,
         task_extension_supported: bool = False,
         approval_mode: str = "inherit",
         tool_approval_modes: Mapping[str, str] | None = None,
@@ -718,6 +734,7 @@ class MCPToolWrapper(Tool, ContextAware):
         self._task_support = _extract_tool_task_support(tool_def)
         self._task_extension_supported = task_extension_supported
         self._tool_timeout = tool_timeout
+        self._task_wait_timeout = task_wait_timeout
         self._approval_mode = (
             approval_mode if approval_mode in _APPROVAL_MODE_VALUES else "inherit"
         )
@@ -776,7 +793,7 @@ class MCPToolWrapper(Tool, ContextAware):
         return await call_tool_as_task(
             self._original_name,
             kwargs,
-            ttl=_TASK_DEFAULT_TTL_MS,
+            ttl=int((self._task_wait_timeout + 60) * 1000),
             meta=_task_request_meta(),
         )
 
@@ -792,7 +809,10 @@ class MCPToolWrapper(Tool, ContextAware):
                 "MCP tool '{}' supports tasks, but no compatible task backend is available; falling back to call_tool()",
                 self._name,
             )
-            result = await self._call_tool(kwargs)
+            result = await asyncio.wait_for(
+                self._call_tool(kwargs),
+                timeout=self._tool_timeout,
+            )
             return _render_text_content(result)
 
         from mcp import types
@@ -814,27 +834,89 @@ class MCPToolWrapper(Tool, ContextAware):
                 return "(MCP task lifecycle unavailable)"
             return "(MCP task creation failed: missing task id)"
 
-        status = await _task_poll_until_terminal(self._session, task_id, backend_kind)
-        if status is None:
-            return "(MCP task polling failed)"
+        started_at = asyncio.get_running_loop().time()
+        logger.info(
+            "MCP task started: tool='{}' backend_kind={} task_id={} wait_timeout={}s",
+            self._name,
+            backend_kind,
+            task_id,
+            self._task_wait_timeout,
+        )
+        try:
+            async with asyncio.timeout(self._task_wait_timeout):
+                status = await _task_poll_until_terminal(self._session, task_id, backend_kind)
+                if status is None:
+                    return "(MCP task polling failed)"
 
-        task_status = getattr(status, "status", None)
-        if task_status in {"input_required", types.TASK_STATUS_COMPLETED}:
-            result = await _task_fetch_result(
-                self._session,
-                task_id,
+                task_status = getattr(status, "status", None)
+                elapsed = asyncio.get_running_loop().time() - started_at
+                logger.info(
+                    "MCP task status: tool='{}' task_id={} status={} elapsed={:.1f}s",
+                    self._name,
+                    task_id,
+                    task_status,
+                    elapsed,
+                )
+                if task_status in {"input_required", types.TASK_STATUS_COMPLETED}:
+                    result = await _task_fetch_result(
+                        self._session,
+                        task_id,
+                        backend_kind,
+                        types.CallToolResult,
+                    )
+                    if result is None:
+                        return "(MCP task result fetch failed)"
+                    return _render_text_content(result)
+                if task_status in {types.TASK_STATUS_FAILED, types.TASK_STATUS_CANCELLED}:
+                    status_message = getattr(status, "statusMessage", None)
+                    if status_message:
+                        return f"(MCP task {task_status}: {status_message})"
+                    return f"(MCP task {task_status})"
+                return f"(MCP task {task_status or 'unknown'})"
+        except asyncio.TimeoutError:
+            elapsed = asyncio.get_running_loop().time() - started_at
+            logger.warning(
+                "MCP task timed out: tool='{}' backend_kind={} task_id={} elapsed={:.1f}s",
+                self._name,
                 backend_kind,
-                types.CallToolResult,
+                task_id,
+                elapsed,
             )
-            if result is None:
-                return "(MCP task result fetch failed)"
-            return _render_text_content(result)
-        if task_status in {types.TASK_STATUS_FAILED, types.TASK_STATUS_CANCELLED}:
-            status_message = getattr(status, "statusMessage", None)
-            if status_message:
-                return f"(MCP task {task_status}: {status_message})"
-            return f"(MCP task {task_status})"
-        return f"(MCP task {task_status or 'unknown'})"
+            try:
+                cancelled = await asyncio.wait_for(
+                    _task_cancel(self._session, task_id, backend_kind),
+                    timeout=self._tool_timeout,
+                )
+                if cancelled:
+                    logger.info(
+                        "MCP task cancel requested: tool='{}' task_id={} result=success",
+                        self._name,
+                        task_id,
+                    )
+                else:
+                    logger.warning(
+                        "MCP task cancel failed: tool='{}' task_id={} error=unsupported",
+                        self._name,
+                        task_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "MCP task cancel failed: tool='{}' task_id={} error={}",
+                    self._name,
+                    task_id,
+                    type(exc).__name__,
+                )
+            return f"(MCP task timed out after {self._task_wait_timeout}s)"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "MCP task failed: tool='{}' task_id={} error={}",
+                self._name,
+                task_id,
+                type(exc).__name__,
+            )
+            return f"(MCP task failed: {type(exc).__name__})"
 
     async def _call_tool_or_task(self, kwargs: dict[str, Any]) -> str:
         if self._task_support in _TASK_SUPPORT_VALUES:
@@ -845,7 +927,10 @@ class MCPToolWrapper(Tool, ContextAware):
                     self._task_support,
                     _task_lifecycle_available(self._session),
                 )
-                result = await self._call_tool(kwargs)
+                result = await asyncio.wait_for(
+                    self._call_tool(kwargs),
+                    timeout=self._tool_timeout,
+                )
                 return _render_text_content(result)
             if not self._supports_tasks:
                 logger.debug(
@@ -861,7 +946,10 @@ class MCPToolWrapper(Tool, ContextAware):
                 self._task_support,
                 _task_lifecycle_available(self._session),
             )
-            create_result = await self._call_tool_as_task(kwargs)
+            create_result = await asyncio.wait_for(
+                self._call_tool_as_task(kwargs),
+                timeout=self._tool_timeout,
+            )
             if create_result is None:
                 return "(MCP task lifecycle unavailable)"
             return await self._call_tool_via_task_backend(
@@ -870,7 +958,10 @@ class MCPToolWrapper(Tool, ContextAware):
                 create_result=create_result,
             )
 
-        result = await self._call_tool(kwargs)
+        result = await asyncio.wait_for(
+            self._call_tool(kwargs),
+            timeout=self._tool_timeout,
+        )
         backend_kind = _task_backend_kind_from_result(result, self._session)
         if backend_kind == _TASK_BACKEND_STANDARD:
             logger.debug(
@@ -945,10 +1036,7 @@ class MCPToolWrapper(Tool, ContextAware):
                 return approval_result
             for attempt in range(attempts):
                 try:
-                    result = await asyncio.wait_for(
-                        self._call_tool_or_task(kwargs),
-                        timeout=self._tool_timeout,
-                    )
+                    result = await self._call_tool_or_task(kwargs)
                 except asyncio.TimeoutError:
                     logger.warning(
                         "MCP tool '{}' timed out after {}s", self._name, self._tool_timeout
@@ -1349,6 +1437,7 @@ async def connect_mcp_servers(
                     name,
                     tool_def,
                     tool_timeout=cfg.tool_timeout,
+                    task_wait_timeout=cfg.task_wait_timeout,
                     task_extension_supported=task_extension_supported,
                     approval_mode=getattr(cfg, "approval_mode", "inherit"),
                     tool_approval_modes=getattr(cfg, "tool_approvals", {}),

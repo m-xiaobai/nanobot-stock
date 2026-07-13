@@ -66,7 +66,7 @@ class _FakeTechnicalAdapter:
         self._snapshots_by_symbol = snapshots_by_symbol
         self.calls: list[tuple[list[str], int, object | None]] = []
 
-    def get_technical_snapshot(
+    async def get_technical_snapshot(
         self,
         symbols: list[str],
         lookback_days: int,

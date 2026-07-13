@@ -150,7 +150,20 @@ def _make_wrapper(session: object, *, timeout: float = 0.1) -> MCPToolWrapper:
         description="demo tool",
         inputSchema={"type": "object", "properties": {}},
     )
-    return MCPToolWrapper(session, "test", tool_def, tool_timeout=timeout)
+    return MCPToolWrapper(
+        session,
+        "test",
+        tool_def,
+        tool_timeout=timeout,
+        approval_mode="always_allow",
+    )
+
+
+def test_mcp_server_config_accepts_task_wait_timeout_alias() -> None:
+    config = MCPServerConfig.model_validate({"taskWaitTimeout": 123})
+
+    assert config.task_wait_timeout == 123
+    assert config.model_dump(by_alias=True)["taskWaitTimeout"] == 123
 
 
 def test_wrapper_preserves_non_nullable_unions() -> None:
@@ -566,12 +579,110 @@ async def test_execute_uses_proactive_task_path_when_tool_declares_task_support(
 
     assert result == "task result"
     assert "call_tool" not in task_session.calls
-    assert task_session.calls["call_tool_as_task"] == ("demo", {"value": 1}, 60000, {
+    assert task_session.calls["call_tool_as_task"] == ("demo", {"value": 1}, 960000, {
         "io.modelcontextprotocol/clientCapabilities": {
             "extensions": {"io.modelcontextprotocol/tasks": {}}
         }
     })
     assert task_session.calls["get_task_result"] == ("task-1", sys.modules["mcp"].types.CallToolResult)
+
+
+@pytest.mark.asyncio
+async def test_task_wait_can_exceed_plain_tool_timeout() -> None:
+    task_session = _make_fake_task_session(
+        status_sequence=[
+            SimpleNamespace(status="completed", statusMessage=None, pollIntervalMs=1),
+        ],
+        result_blocks=[_FakeTextContent("slow task result")],
+        get_task_delay=0.03,
+    )
+    wrapper = MCPToolWrapper(
+        task_session,
+        "test",
+        _make_task_tool_def("demo"),
+        tool_timeout=0.01,
+        task_wait_timeout=0.1,
+        task_extension_supported=True,
+    )
+
+    result = await wrapper.execute()
+
+    assert result == "slow task result"
+    assert task_session.calls["call_tool_as_task"][2] == 60100
+
+
+@pytest.mark.asyncio
+async def test_task_creation_uses_plain_tool_timeout() -> None:
+    task_session = _make_fake_task_session(
+        status_sequence=[
+            SimpleNamespace(status="completed", statusMessage=None, pollIntervalMs=1),
+        ],
+        result_blocks=[_FakeTextContent("unused")],
+        create_task_delay=0.05,
+    )
+    wrapper = MCPToolWrapper(
+        task_session,
+        "test",
+        _make_task_tool_def("demo"),
+        tool_timeout=0.01,
+        task_wait_timeout=0.1,
+        task_extension_supported=True,
+    )
+
+    result = await wrapper.execute()
+
+    assert result == "(MCP tool call timed out after 0.01s)"
+    assert "get_task" not in task_session.calls
+    assert "cancel_task" not in task_session.calls
+
+
+@pytest.mark.asyncio
+async def test_task_wait_timeout_cancels_task_once() -> None:
+    task_session = _make_fake_task_session(
+        status_sequence=[
+            SimpleNamespace(status="working", statusMessage=None, pollIntervalMs=1),
+        ],
+        result_blocks=[],
+        get_task_delay=0.05,
+    )
+    wrapper = MCPToolWrapper(
+        task_session,
+        "test",
+        _make_task_tool_def("demo"),
+        tool_timeout=0.1,
+        task_wait_timeout=0.01,
+        task_extension_supported=True,
+    )
+
+    result = await wrapper.execute()
+
+    assert result == "(MCP task timed out after 0.01s)"
+    assert task_session.calls["cancel_task"] == ["task-1"]
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_failure_preserves_task_timeout_result() -> None:
+    task_session = _make_fake_task_session(
+        status_sequence=[
+            SimpleNamespace(status="working", statusMessage=None, pollIntervalMs=1),
+        ],
+        result_blocks=[],
+        get_task_delay=0.05,
+        cancel_error=RuntimeError("cancel failed"),
+    )
+    wrapper = MCPToolWrapper(
+        task_session,
+        "test",
+        _make_task_tool_def("demo"),
+        tool_timeout=0.1,
+        task_wait_timeout=0.01,
+        task_extension_supported=True,
+    )
+
+    result = await wrapper.execute()
+
+    assert result == "(MCP task timed out after 0.01s)"
+    assert task_session.calls["cancel_task"] == ["task-1"]
 
 
 @pytest.mark.asyncio
@@ -640,7 +751,7 @@ async def test_execute_prefers_poll_task_when_available() -> None:
 
     assert result == "task result"
     assert "call_tool" not in task_session.calls
-    assert task_session.calls["call_tool_as_task"] == ("demo", {"value": 1}, 60000, {
+    assert task_session.calls["call_tool_as_task"] == ("demo", {"value": 1}, 960000, {
         "io.modelcontextprotocol/clientCapabilities": {
             "extensions": {"io.modelcontextprotocol/tasks": {}}
         }
@@ -672,7 +783,7 @@ async def test_execute_fetches_task_result_when_input_required() -> None:
 
     assert result == "approved result"
     assert "call_tool" not in task_session.calls
-    assert task_session.calls["call_tool_as_task"] == ("demo", {"value": 1}, 60000, {
+    assert task_session.calls["call_tool_as_task"] == ("demo", {"value": 1}, 960000, {
         "io.modelcontextprotocol/clientCapabilities": {
             "extensions": {"io.modelcontextprotocol/tasks": {}}
         }
@@ -901,6 +1012,7 @@ def _make_tool_def(name: str) -> SimpleNamespace:
         name=name,
         description=f"{name} tool",
         inputSchema={"type": "object", "properties": {}},
+        annotations=SimpleNamespace(readOnlyHint=True, destructiveHint=False),
     )
 
 
@@ -909,6 +1021,7 @@ def _make_task_tool_def(name: str, task_support: str = "required") -> SimpleName
         name=name,
         description=f"{name} tool",
         inputSchema={"type": "object", "properties": {}},
+        annotations=SimpleNamespace(readOnlyHint=True, destructiveHint=False),
         execution=SimpleNamespace(taskSupport=task_support),
     )
 
@@ -931,6 +1044,9 @@ def _make_fake_task_session(
     server_capabilities: object | None = None,
     include_poll_task: bool = False,
     call_tool_result: object | None = None,
+    create_task_delay: float = 0,
+    get_task_delay: float = 0,
+    cancel_error: Exception | None = None,
 ) -> SimpleNamespace:
     calls: dict[str, object] = {}
     task_index = {"value": 0}
@@ -968,10 +1084,14 @@ def _make_fake_task_session(
         meta: dict[str, object] | None = None,
     ) -> SimpleNamespace:
         calls["call_tool_as_task"] = (name, arguments, ttl, meta)
+        if create_task_delay:
+            await asyncio.sleep(create_task_delay)
         return SimpleNamespace(task=SimpleNamespace(taskId="task-1"))
 
     async def get_task(task_id: str) -> SimpleNamespace:
         calls.setdefault("get_task", []).append(task_id)
+        if get_task_delay:
+            await asyncio.sleep(get_task_delay)
         index = min(task_index["value"], len(status_sequence) - 1)
         task_index["value"] += 1
         return status_sequence[index]
@@ -980,10 +1100,16 @@ def _make_fake_task_session(
         calls["get_task_result"] = (task_id, result_type)
         return SimpleNamespace(content=result_blocks)
 
+    async def cancel_task(task_id: str) -> None:
+        calls.setdefault("cancel_task", []).append(task_id)
+        if cancel_error is not None:
+            raise cancel_error
+
     experimental_kwargs: dict[str, object] = {
         "call_tool_as_task": call_tool_as_task,
         "get_task": get_task,
         "get_task_result": get_task_result,
+        "cancel_task": cancel_task,
     }
     if include_poll_task:
         async def poll_task(task_id: str):
@@ -1096,7 +1222,7 @@ async def test_connect_mcp_servers_enables_task_tools_only_when_server_advertise
     assert fake_mcp_runtime["session"].calls["call_tool_as_task"] == (
         "demo",
         {"value": 1},
-        60000,
+        960000,
         {
             "io.modelcontextprotocol/clientCapabilities": {
                 "extensions": {"io.modelcontextprotocol/tasks": {}}

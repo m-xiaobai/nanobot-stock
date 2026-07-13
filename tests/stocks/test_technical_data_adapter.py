@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from typing import Any
 
@@ -12,8 +13,10 @@ class _FakeTool:
     def __init__(self, response: str) -> None:
         self._response = response
         self.calls: list[dict[str, Any]] = []
+        self.loops: list[asyncio.AbstractEventLoop] = []
 
     async def execute(self, **kwargs: Any) -> str:
+        self.loops.append(asyncio.get_running_loop())
         self.calls.append(dict(kwargs))
         return self._response
 
@@ -28,13 +31,17 @@ class _FakeRegistry:
         return self._tool
 
 
-def test_adapter_maps_batch_request_to_mcp_tool() -> None:
+@pytest.mark.asyncio
+async def test_adapter_maps_batch_request_to_mcp_tool() -> None:
     tool = _FakeTool(
         '{"items":[{"symbol":"600001","close":12.3},{"symbol":"000001","close":9.1}]}'
     )
     adapter = MCPTechnicalDataAdapter(server_name="stocks", tool_registry=_FakeRegistry(tool))
 
-    result = adapter.get_technical_snapshot(["600001", "000001"], 60, date(2026, 5, 26))
+    current_loop = asyncio.get_running_loop()
+    result = await adapter.get_technical_snapshot(
+        ["600001", "000001"], 60, date(2026, 5, 26)
+    )
 
     assert tool.calls == [
         {
@@ -58,13 +65,15 @@ def test_adapter_maps_batch_request_to_mcp_tool() -> None:
             "data_status": "ok",
         },
     }
+    assert tool.loops == [current_loop]
 
 
-def test_adapter_rejects_empty_symbol_batches() -> None:
+@pytest.mark.asyncio
+async def test_adapter_rejects_empty_symbol_batches() -> None:
     tool = _FakeTool('{"items":[{"symbol":"600001","close":12.3}]}')
     adapter = MCPTechnicalDataAdapter(server_name="stocks", tool_registry=_FakeRegistry(tool))
 
     with pytest.raises(ValueError, match="at least one symbol"):
-        adapter.get_technical_snapshot([], 60, date(2026, 5, 26))
+        await adapter.get_technical_snapshot([], 60, date(2026, 5, 26))
 
     assert tool.calls == []

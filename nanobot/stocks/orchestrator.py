@@ -50,7 +50,7 @@ class InlineSubagentExecutor(Protocol):
 
 
 class TechnicalDataAdapter(Protocol):
-    def get_technical_snapshot(
+    async def get_technical_snapshot(
         self,
         symbols: list[str],
         lookback_days: int,
@@ -946,8 +946,7 @@ class StockSelectionSubagentOrchestrator:
             technical_snapshots: dict[str, dict[str, Any]] | None = None
         else:
             try:
-                batch_result = await asyncio.to_thread(
-                    self.technical_data.get_technical_snapshot,
+                batch_result = await self.technical_data.get_technical_snapshot(
                     symbols,
                     60,
                     trade_date,

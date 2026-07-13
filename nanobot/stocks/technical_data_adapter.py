@@ -26,14 +26,12 @@ class MCPTechnicalDataAdapter:
         self._lookback_days = lookback_days
         self._tool_registry = tool_registry
 
-    def get_technical_snapshot(
+    async def get_technical_snapshot(
         self,
         symbols: list[str],
         lookback_days: int,
         anchor_date: date | None = None,
     ) -> dict[str, dict[str, Any]]:
-        import asyncio
-
         shared_tool = self._get_registered_tool()
         if shared_tool is None:
             tool_name = f"mcp_{self._server_name}_{self._tool_name}"
@@ -45,17 +43,14 @@ class MCPTechnicalDataAdapter:
         if not symbols:
             raise ValueError("at least one symbol is required for technical snapshot retrieval")
 
-        async def _run_shared() -> dict[str, dict[str, Any]]:
-            params = {
-                "symbols": symbols,
-                "trade_date": anchor_date.isoformat() if anchor_date is not None else None,
-                "lookback_days": lookback_days or self._lookback_days,
-                "include_bars": False,
-            }
-            raw = await shared_tool.execute(**params)
-            return self._parse_snapshot_payload(raw, symbols, lookback_days)
-
-        return asyncio.run(_run_shared())
+        params = {
+            "symbols": symbols,
+            "trade_date": anchor_date.isoformat() if anchor_date is not None else None,
+            "lookback_days": lookback_days or self._lookback_days,
+            "include_bars": False,
+        }
+        raw = await shared_tool.execute(**params)
+        return self._parse_snapshot_payload(raw, symbols, lookback_days)
 
     def _get_registered_tool(self) -> "Tool | None":
         if self._tool_registry is None:
